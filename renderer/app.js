@@ -9,6 +9,22 @@ const $ = (s) => document.querySelector(s);
 
 const FRESH_LIMIT_DAYS = 1;
 
+// 侧栏底部的两个外链。地址在这里集中一份，真正能不能开由主进程白名单说了算。
+const LINKS = {
+  triple: 'https://www.bilibili.com/video/BV1i2eS69E3z/?share_source=copy_web&vd_source=a7371052883da345eff9c7f52427819b',
+  repo: 'https://github.com/youyu551572/ZCode-Panel',
+};
+
+/** 交给系统默认浏览器打开外链；被主进程白名单拒了就明确说一声，不静默失败 */
+async function openExternal(url, label) {
+  try {
+    const r = await api.openUrl(url);
+    if (r && !r.ok) toast((r.msg || '打开失败'), false, 3000);
+  } catch (e) {
+    toast((label || '打开链接') + '失败：' + (e.message || e), false, 3000);
+  }
+}
+
 function escapeHtml(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;')
@@ -1148,6 +1164,8 @@ function bindEvents() {
   on('#btn-quota-refresh', 'click', () => doQuotaRefresh());
   on('#btn-refresh', 'click', refresh);
   on('#btn-settings', 'click', () => openSettings(false));
+  on('#btn-triple', 'click', () => openExternal(LINKS.triple, '一键三连'));
+  on('#btn-repo', 'click', () => openExternal(LINKS.repo, '开源项目地址'));
   on('#set-close', 'click', closeSettings);
   on('#set-save', 'click', doSettingsSave);
   on('#set-exe-pick', 'click', doSettingsPickExe);

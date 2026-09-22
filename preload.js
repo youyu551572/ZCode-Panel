@@ -58,5 +58,7 @@ contextBridge.exposeInMainWorld('zpanel', {
   planRemote: (id) => ipcRenderer.invoke('plan:remote', id),
   planState: () => ipcRenderer.invoke('plan:state'),
   openApp: () => ipcRenderer.invoke('app:open'),
+  // 外链一律交给系统默认浏览器打开（主进程侧带地址白名单校验）
+  openUrl: (url) => ipcRenderer.invoke('app:open-url', url),
   quitApp: () => ipcRenderer.invoke('app:quit'),
 });

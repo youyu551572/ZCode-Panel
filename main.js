@@ -2368,6 +2368,38 @@ ipcMain.handle('panel:ask-abort', (_e, id) => {
 ipcMain.handle('oauth:link', (_e, provider, mode) => buildManualAuthorizeLink(provider || 'bigmodel', mode || 'direct'));
 ipcMain.handle('oauth:submit', (_e, input) => submitManualCode(input));
 ipcMain.handle('balance:fetch', (_e, force) => balance.fetchBalance(force));
+
+// 面板里点外链（一键三连 / 开源地址）时走这里，交给系统默认浏览器打开。
+//
+// 为什么不在渲染层直接 <a href> 或 window.open：
+//   ① <a href> 会让面板自己的窗口导航走，整个界面没了；
+//   ② window.open 在没注册 setWindowOpenHandler 的情况下会开出第二个 Electron 窗口，
+//      应该由使用者的浏览器来开。
+// 为什么带白名单：跳转目标在渲染层是被拼出来的字符串，这里收口成「只认这两条」，
+// 免得任何一处被注入的内容都能当成跳板去开任意 URL。
+const OPEN_URL_ALLOW = [
+  { origin: 'https://www.bilibili.com', path: '/video/BV1i2eS69E3z' },
+  { origin: 'https://github.com', path: '/youyu551572/ZCode-Panel' },
+];
+
+ipcMain.handle('app:open-url', async (_e, raw) => {
+  let u;
+  try {
+    u = new URL(String(raw || ''));
+  } catch (_) {
+    return { ok: false, msg: '链接格式不对' };
+  }
+  if (u.protocol !== 'https:') return { ok: false, msg: '只允许 https 链接' };
+  const allowed = OPEN_URL_ALLOW.some((a) => u.origin === a.origin && u.pathname.startsWith(a.path));
+  if (!allowed) return { ok: false, msg: '这个地址不在允许打开的范围内' };
+  try {
+    await shell.openExternal(u.toString());
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, msg: (e && e.message) || String(e) };
+  }
+});
+
 ipcMain.handle('app:open', async () => {
   const id = currentAccountId();
   if (!id) {

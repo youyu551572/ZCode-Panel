@@ -94,6 +94,32 @@ body {
 .current-user { font-size: 15px; font-weight: 700; color: var(--blue-900); }
 .current-status { margin-top: 6px; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
 
+/* ===== 侧栏底部：一键三连 / 作者 / 开源地址 ===== */
+.side-foot {
+  margin-top: auto;              /* 内容不足一屏时把这一块压到侧栏底部 */
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  animation: rise 0.5s ease both;
+}
+/* 红色主按钮：用 B 站那个红，和面板的蓝区分开，一眼能看见 */
+.btn--triple {
+  background: linear-gradient(135deg, #fb7299, #e1554b);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  letter-spacing: 0.6px;
+  box-shadow: 0 8px 18px rgba(225, 85, 75, 0.32);
+}
+.btn--triple:hover { transform: translateY(-1px); box-shadow: 0 12px 26px rgba(225, 85, 75, 0.42); }
+.btn--triple:focus-visible { outline-color: var(--bad); }
+.side-foot__icon { width: 14px; height: 14px; flex-shrink: 0; }
+.side-foot__author { font-size: 11.5px; color: var(--muted); text-align: center; letter-spacing: 0.3px; }
+.side-foot__author b { color: var(--blue-900); font-weight: 700; }
+
 /* ===== 自动接码开关 ===== */
 .switch {
   display: inline-flex; align-items: center; gap: 7px;
