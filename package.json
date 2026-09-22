@@ -33,6 +33,7 @@
       "plan.js",
       "remote-plan.js",
       "login-driver.js",
+      "update.js",
       "icon.ico",
       "renderer/**/*"
     ],

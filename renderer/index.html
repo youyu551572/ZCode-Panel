@@ -245,6 +245,44 @@
     </div>
   </div>
 
+  <!-- 强制更新：发现新版本时盖住整个面板。故意不给关闭按钮、也不允许点背景关掉 -->
+  <div id="update-modal" class="modal modal--force hidden">
+    <div class="modal__box modal__box--wide">
+      <div class="update-badge">发现新版本</div>
+      <h2>需要先更新才能继续使用</h2>
+
+      <div class="update-versions">
+        <div class="update-ver">
+          <span class="update-ver__label">当前版本</span>
+          <span id="update-current" class="update-ver__value">--</span>
+        </div>
+        <div class="update-ver__arrow">→</div>
+        <div class="update-ver">
+          <span class="update-ver__label">最新版本</span>
+          <span id="update-latest" class="update-ver__value update-ver__value--new">--</span>
+        </div>
+      </div>
+
+      <div id="update-meta" class="update-meta"></div>
+
+      <div class="notice notice--warn">
+        <b>为什么必须先更新</b>
+        <span>旧版本可能与 ZCode 客户端或服务端接口不再兼容，继续用会出现说不清的报错。更新只是换一个新的 exe，账号数据在 <code>%APPDATA%\zcode-panel</code>，不会丢。</span>
+      </div>
+
+      <div id="update-notes-wrap" class="update-notes-wrap hidden">
+        <div class="update-notes__title">这个版本更新了什么</div>
+        <pre id="update-notes" class="update-notes"></pre>
+      </div>
+
+      <div class="modal__actions">
+        <button id="update-quit" class="btn btn--ghost">退出面板</button>
+        <button id="update-page" class="btn btn--ghost">打开发布页</button>
+        <button id="update-download" class="btn btn--primary">去下载新版本</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 必须放在所有弹窗之后：bindEvents() 用 querySelector 取元素，
        脚本提前执行的话后出现的弹窗元素还没解析出来，绑定会被静默跳过 -->
   <script src="app.js"></script>

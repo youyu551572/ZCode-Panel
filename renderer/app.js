@@ -1070,7 +1070,60 @@ function initPanel() {
   loadZcodeProxy({ silent: true });
 }
 
+// ===== 强制更新 =====
+//
+// 只拦「确实查到了更新的版本」这一种情况。网络不通、GitHub 限流、仓库还没发
+// Release —— 全部放行：判断逻辑在主进程的 update.js 里，宁可漏更新也不能误锁。
+//
+// 这里不 await、也不拖住首屏：查一次网络最多要几秒，让它和账号加载并行跑，
+// 真发现新版本时再把遮罩盖上去。
+
+let updateModalShown = false;
+
+function renderUpdateModal(info) {
+  const rel = info.release || {};
+  $('#update-current').textContent = info.current || '--';
+  $('#update-latest').textContent = info.latest || '--';
+
+  const meta = [];
+  if (rel.publishedAt) meta.push('发布于 ' + fmtDate(rel.publishedAt));
+  if (rel.assetName) {
+    meta.push('更新包 ' + rel.assetName + (rel.assetSize ? '（' + rel.assetSize + '）' : ''));
+  }
+  $('#update-meta').textContent = meta.join('　·　');
+
+  // Release 说明是外部内容，一律走 textContent，绝不拼 innerHTML
+  const notes = String(rel.notes || '').trim();
+  if (notes) {
+    $('#update-notes').textContent = notes;
+    $('#update-notes-wrap').classList.remove('hidden');
+  }
+
+  $('#update-modal').classList.remove('hidden');
+  updateModalShown = true;
+}
+
+async function checkForUpdate() {
+  if (updateModalShown) return;
+  let r = null;
+  try {
+    r = await api.updateCheck();
+  } catch (_) {
+    return;          // 主进程那边出问题也不该拦人
+  }
+  if (r && r.hasUpdate) renderUpdateModal(r);
+}
+
 function bindEvents() {
+  on('#update-download', 'click', async () => {
+    const r = await api.updateOpenDownload().catch(() => null);
+    if (r && !r.ok) toast((r.msg || '打开下载失败'), false, 3400);
+  });
+  on('#update-page', 'click', async () => {
+    const r = await api.updateOpenPage().catch(() => null);
+    if (r && !r.ok) toast((r.msg || '打开发布页失败'), false, 3400);
+  });
+  on('#update-quit', 'click', () => { api.updateQuit().catch(() => {}); });
   on('#btn-oauth', 'click', () => doOAuth('bigmodel'));
   // Z.ai 那条线必须先连上国际版，否则注册不出纯 Z.ai 账号——用弹窗说清楚，
   // 而不是等流程跑到「切注册表单」失败再让人猜原因。
@@ -1176,6 +1229,7 @@ function bindEvents() {
 }
 
 bindEvents();
+checkForUpdate();
 initPanel();
 refresh();
 

@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, protocol, session, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, protocol, session, shell, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -13,6 +13,7 @@ const plan = require('./plan');
 const remotePlan = require('./remote-plan');
 const { LoginDriver, ZaiMailDriver } = require('./login-driver');
 const settings = require('./settings');
+const update = require('./update');
 
 const HOME = os.homedir();
 
@@ -2264,7 +2265,11 @@ ipcMain.handle('accounts:capture', async (_e, id, replace) => {
   }
   return res;
 });
-ipcMain.handle('accounts:switch', (_e, id, opts) => switchAccount(id, opts || {}));
+ipcMain.handle('accounts:switch', (_e, id, opts) => {
+  const blocked = updateGate();
+  if (blocked) return blocked;
+  return switchAccount(id, opts || {});
+});
 ipcMain.handle('accounts:delete', (_e, id) => deleteAccount(id));
 ipcMain.handle('accounts:rollback', () => rollback());
 // 面板授权窗口的会话状态。残留会话会导致下次授权绑到上一个 BigModel 账号，
@@ -2422,7 +2427,151 @@ ipcMain.handle('app:open-url', async (_e, raw) => {
   }
 });
 
+// ---------------------------------------------------------------- 强制更新
+
+/**
+ * 最近一次检查到的 Release，以及「是否处于必须更新」的状态。
+ *
+ * 渲染层只说「打开下载页 / 打开发布页」，地址一律由这里提供 ——
+ * 主进程不接受渲染层传来的 URL，所以即使渲染层被注入也没有参数能让它去开任意地址。
+ */
+let lastRelease = null;
+let updateRequired = false;
+
+/** 必须更新时挡掉会真正动客户端的那几个动作（界面之外再上一道） */
+function updateGate() {
+  return updateRequired
+    ? {
+        ok: false,
+        needUpdate: true,
+        msg: '发现新版本，请先更新后再使用。点面板上的「去下载」获取新版本。',
+      }
+    : null;
+}
+
+/**
+ * 走 Electron 的 net（Chromium 网络栈）而不是 node 的 https。
+ *
+ * 理由和探测出口地区时一样：它能吃到系统代理和 TUN。直连 api.github.com
+ * 在不少网络下根本拿不到，走代理才通。
+ *
+ * 这里把超时、非 2xx、非 JSON 全部收敛成 reject —— 上层据此「放行」，
+ * 不会因为一次请求失败就把使用者锁在软件外面。
+ */
+function fetchGithubJson(url, timeout = 8000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+    let req = null;
+    const finish = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(v);
+    };
+
+    try {
+      req = net.request({ method: 'GET', url });
+    } catch (e) {
+      return reject(e);
+    }
+
+    timer = setTimeout(() => {
+      try { req.abort(); } catch (_) {}
+      finish(reject, new Error('请求超时'));
+    }, timeout);
+
+    req.setHeader('Accept', 'application/vnd.github+json');
+    req.setHeader('User-Agent', 'ZCode-Panel-Updater');
+    req.on('response', (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(Buffer.from(c)));
+      res.on('end', () => {
+        if (res.statusCode === 404) return finish(reject, new Error('这个仓库还没有发布 Release'));
+        if (res.statusCode === 403) return finish(reject, new Error('GitHub API 限流（每小时 60 次），过一会儿再试'));
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return finish(reject, new Error('HTTP ' + res.statusCode));
+        }
+        try {
+          finish(resolve, JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        } catch (_) {
+          finish(reject, new Error('返回内容不是合法 JSON'));
+        }
+      });
+      res.on('error', (e) => finish(reject, e));
+    });
+    req.on('error', (e) => finish(reject, e));
+    req.end();
+  });
+}
+
+ipcMain.handle('update:check', async () => {
+  // 开发与排障出口：ZPANEL_SKIP_UPDATE=1 跳过检查（正式发布不要设它）
+  if (process.env.ZPANEL_SKIP_UPDATE === '1') {
+    updateRequired = false;
+    lastRelease = null;
+    return { ok: false, hasUpdate: false, current: app.getVersion(), latest: null, release: null, reason: 'skipped' };
+  }
+
+  const r = await update.checkForUpdate({
+    currentVersion: app.getVersion(),
+    fetchJson: fetchGithubJson,
+  });
+
+  updateRequired = !!r.hasUpdate;
+  lastRelease = r.hasUpdate ? r.release : null;
+
+  return {
+    ok: r.ok,
+    hasUpdate: r.hasUpdate,
+    current: r.current,
+    latest: r.latest,
+    reason: r.reason,
+    msg: r.msg || '',
+    release: r.release
+      ? {
+          name: r.release.name,
+          notes: r.release.notes,
+          publishedAt: r.release.publishedAt,
+          hasAsset: !!r.release.asset,
+          assetName: r.release.asset ? r.release.asset.name : '',
+          assetSize: r.release.asset ? update.fmtSize(r.release.asset.size) : '',
+        }
+      : null,
+  };
+});
+
+// 下载与发布页都用主进程自己缓存的那份 Release，不接受渲染层传地址
+ipcMain.handle('update:open-download', async () => {
+  const url = lastRelease && lastRelease.asset && lastRelease.asset.url;
+  if (!url) return { ok: false, msg: '这次发布没有附带 exe，请打开发布页手动选择' };
+  try {
+    await shell.openExternal(url);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, msg: (e && e.message) || String(e) };
+  }
+});
+
+ipcMain.handle('update:open-page', async () => {
+  const url = lastRelease && lastRelease.pageUrl;
+  if (!url) return { ok: false, msg: '没有可打开的发布页地址' };
+  try {
+    await shell.openExternal(url);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, msg: (e && e.message) || String(e) };
+  }
+});
+
+ipcMain.handle('update:quit', () => {
+  app.quit();
+  return { ok: true };
+});
+
 ipcMain.handle('app:open', async () => {
+  const blocked = updateGate();
+  if (blocked) return blocked;
   const id = currentAccountId();
   if (!id) {
     return { ok: false, msg: '还没有选中账号。先在列表里切一个，或点「捕获当前登录」把当前账号存进来。' };

@@ -634,6 +634,59 @@ body {
   z-index: 60;
 }
 .modal.hidden { display: none; }
+
+/* ===== 强制更新遮罩 =====
+   比其他弹窗高一层：它出现时不允许有任何东西盖在它上面，也不给关闭入口 */
+.modal--force {
+  z-index: 200;
+  background: rgba(12, 45, 107, 0.55);
+}
+.update-badge {
+  display: inline-block;
+  margin-bottom: 10px;
+  padding: 3px 11px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  background: rgba(225, 85, 75, 0.12);
+  color: var(--bad);
+  border: 1px solid rgba(225, 85, 75, 0.30);
+}
+.update-versions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 2px 0 14px;
+}
+.update-ver { display: flex; flex-direction: column; gap: 3px; }
+.update-ver__label { font-size: 11.5px; font-weight: 600; color: var(--muted); }
+.update-ver__value {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--blue-900);
+}
+.update-ver__value--new { color: var(--ok); }
+.update-ver__arrow { margin-top: 15px; font-size: 16px; color: var(--muted); }
+.update-meta { margin-bottom: 13px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+.update-notes-wrap { margin-top: 4px; }
+.update-notes__title { margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.update-notes {
+  max-height: 180px;
+  overflow: auto;
+  margin: 0;
+  padding: 11px 13px;
+  background: var(--blue-50);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .modal__box {
   width: 360px;
   max-width: 100%;
