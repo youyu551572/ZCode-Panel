@@ -94,6 +94,18 @@ ZCode 客户端本身给主会话下发 `mode=direct`（主动绕过系统代理
 
 ## 运行
 
+### 方式一：直接下 exe（普通使用者用这个）
+
+到 [Releases](https://github.com/youyu551572/ZCode-Panel/releases) 下载 `ZCode-Panel-1.0.0-portable.exe`，双击即可，**不需要装 Node.js**。
+
+首次打开 Windows 可能弹「Windows 已保护你的电脑」（SmartScreen）——因为这个 exe 没有代码签名。点 **「更多信息」→「仍要运行」** 就能打开。
+
+**前提：先装好 ZCode 桌面客户端。** 面板只是它的多账号外挂，账号登录、切换客户端、查额度都要靠客户端本体；没装客户端时面板会自己弹出设置页让你指定 `ZCode.exe`。
+
+打包版的账号库落在 `%APPDATA%\zcode-panel\accounts\`（不是 exe 所在目录，因为便携版每次启动会解压到临时目录）。
+
+### 方式二：从源码跑
+
 需要 Node.js 18+ 和已安装的 ZCode 桌面客户端。
 
 ```bash
@@ -102,6 +114,24 @@ npm start
 ```
 
 Windows 上也可以直接双击 `zpanel.cmd`。
+
+### 自己打包
+
+```bash
+npm install
+npm run dist
+```
+
+产物在 `dist/`：
+
+| 文件 | 说明 |
+| --- | --- |
+| `ZCode-Panel-1.0.0-portable.exe` | 单文件绿色版，双击即用，方便发给别人 |
+| `win-unpacked/ZCode Panel.exe` | 解压好的目录版，启动更快（免去便携版每次解压到临时目录） |
+
+打包用的是**白名单**，只收 `main.js` / `preload.js` / `settings.js` / `oauth.js` / `balance.js` / `plan.js` / `remote-plan.js` / `login-driver.js` / `icon.ico` / `renderer/`。
+
+**`accounts/` 永远不进包** —— 那里面是真实登录凭据，而且它下面的 `cli/`、`workspace/` 还是指向 `~/.zcode` 的目录联接，一旦误收会把你的对话记录、插件一起打进 exe 里发出去。
 
 ### 首次运行与设置
 
@@ -127,7 +157,7 @@ Windows 上也可以直接双击 `zpanel.cmd`。
 | 变量 | 作用 |
 | --- | --- |
 | `ZCODE_EXE` | 指定 ZCode 客户端路径。优先级低于设置页里的值 |
-| `ZPANEL_ACCOUNTS_DIR` | 指定账号数据目录。不设时用面板目录下的 `accounts/` |
+| `ZPANEL_ACCOUNTS_DIR` | 指定账号数据目录。不设时：源码运行 = 面板目录下的 `accounts/`；打包运行 = `%APPDATA%\zcode-panel\accounts` |
 
 ### 优先级
 

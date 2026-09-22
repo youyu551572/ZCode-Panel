@@ -2299,11 +2299,13 @@ ipcMain.handle('plans:quota', async (_e, force) => {
   // 新架构下每个账号各写各的日志，本来就只含它自己的记录。再叠一层
   // user_plan_id 精确匹配，是为了兜住"客户端还在跑上一个账号"这种过渡期。
   const accId = currentAccountId();
-  const expectPlanId = userPlanIdOfAccount(accId);
-  const data = await plan.fetchPlans(readActiveProvider(), !!force, expectPlanId, logsOf(accId));
 
   // 还没有当前账号（账号库是空的，或刚被清空）时没有可显示的额度，
   // 如实说明，不要退回全局日志去猜——那正是以前串号的来源。
+  //
+  // ⚠️ 这个判断必须排在下面任何用到 accId 的调用之前。全新安装时账号库是空的，
+  // accId 为 null，而 logsOf(null) 会在 path.join 里直接抛
+  // ERR_INVALID_ARG_TYPE（表现是首屏「套餐与额度」一直报错）。
   if (!accId) {
     return {
       ok: false,
@@ -2311,6 +2313,9 @@ ipcMain.handle('plans:quota', async (_e, force) => {
       msg: '还没有选中任何账号。先在列表里切一个，或点「捕获当前登录」把当前账号存进来。',
     };
   }
+
+  const expectPlanId = userPlanIdOfAccount(accId);
+  const data = await plan.fetchPlans(readActiveProvider(), !!force, expectPlanId, logsOf(accId));
 
   // 这个账号自己的日志里还没有记录时，退回它自己的旧快照并标注 stale。
   // 绝不能退回"最后一条"——新架构下虽然各写各的，但客户端可能还在跑上一个账号。

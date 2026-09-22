@@ -2,14 +2,59 @@
   "name": "zcode-panel",
   "version": "1.0.0",
   "description": "ZCode 多账号管理面板",
+  "author": "YouYu",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "dist": "electron-builder --win --x64"
   },
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
   },
   "allowScripts": {
     "electron@33.4.11": true
+  },
+  "build": {
+    "appId": "xyz.youyuaiwan.zcode-panel",
+    "productName": "ZCode Panel",
+    "copyright": "Copyright (c) 2026 ZCode Panel contributors",
+    "directories": {
+      "output": "dist"
+    },
+    "asar": true,
+    "compression": "maximum",
+    "files": [
+      "main.js",
+      "preload.js",
+      "settings.js",
+      "oauth.js",
+      "balance.js",
+      "plan.js",
+      "remote-plan.js",
+      "login-driver.js",
+      "icon.ico",
+      "renderer/**/*"
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "ZCode-Panel-${version}-portable.exe"
+    }
   }
 }

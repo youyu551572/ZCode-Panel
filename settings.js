@@ -303,7 +303,13 @@ function lastDetectResult() {
 // ---------------------------------------------------------------- 账号目录
 
 function defaultAccountsDir() {
-  return process.env.ZPANEL_ACCOUNTS_DIR || path.join(__dirname, 'accounts');
+  if (process.env.ZPANEL_ACCOUNTS_DIR) return process.env.ZPANEL_ACCOUNTS_DIR;
+  // 打包后 __dirname 落在 resources\app.asar 里面，那是个只读的虚拟归档：
+  // 往里 mkdir / 写账号数据会失败，而 accountsDir() 又把 mkdir 的错误吞掉了，
+  // 结果是「面板能开、一添加账号就没反应」。所以打包态必须换到用户可写的位置。
+  // 开发态（源码目录）保持原样，账号库就放在项目下的 accounts/。
+  if (__dirname.includes('app.asar')) return path.join(APP_DIR, 'accounts');
+  return path.join(__dirname, 'accounts');
 }
 
 /** 最终生效的账号目录（同步，带 mkdir） */
