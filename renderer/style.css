@@ -517,6 +517,20 @@ body {
 .btn--danger { background: rgba(225, 85, 75, 0.08); color: var(--bad); }
 .btn--danger:hover { background: rgba(225, 85, 75, 0.14); }
 .btn--block { width: 100%; }
+/* 已失效功能的按钮：整体压暗，右上角挂一个红色徽标 */
+.btn--dead { position: relative; opacity: 0.62; }
+.btn--dead:hover { background: var(--blue-50); opacity: 0.78; }
+.btn__badge {
+  margin-left: 7px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  border-radius: 6px;
+  background: rgba(225, 85, 75, 0.12);
+  color: var(--bad);
+  border: 1px solid rgba(225, 85, 75, 0.28);
+}
 
 /* 工具栏按钮：紧凑尺寸，必须声明在 .btn 之后，否则被基础样式覆盖 */
 .btn--lg {
@@ -657,39 +671,28 @@ body {
 .modal__hint b { color: var(--blue-900); font-weight: 600; }
 .modal__hint + .modal__hint { margin-top: -6px; }
 
-/* 出口地区检测行 */
-.probe-line {
+/* 说明块：用于讲清「某个功能已经不能用了」这类需要完整交代的事 */
+.notice {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   margin: 4px 0 18px;
-  padding: 8px 11px;
-  border-radius: 10px;
-  font-size: 12px;
-  line-height: 1.5;
-  background: var(--blue-50);
-  border: 1px solid var(--line);
+  padding: 13px 15px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+.notice b { font-size: 13.5px; font-weight: 700; display: block; }
+.notice--warn {
+  background: rgba(229, 155, 47, 0.10);
+  border: 1px solid rgba(229, 155, 47, 0.32);
   color: var(--muted);
 }
-.probe-line__dot {
-  flex: 0 0 auto;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
-}
-.probe-line__text { flex: 1; min-width: 0; }
-.probe-line .btn { flex: 0 0 auto; padding: 2px 8px; font-size: 11px; }
-.probe-line--busy .probe-line__dot { background: var(--blue-500); animation: manual-dot 1.2s ease-in-out infinite; }
-.probe-line--ok { background: rgba(23, 148, 90, 0.08); border-color: rgba(23, 148, 90, 0.32); color: var(--ok); }
-.probe-line--ok .probe-line__dot { background: var(--ok); }
-.probe-line--bad { background: rgba(217, 48, 37, 0.07); border-color: rgba(217, 48, 37, 0.30); color: var(--bad); }
-.probe-line--bad .probe-line__dot { background: var(--bad); }
-.probe-line--warn { background: rgba(184, 134, 11, 0.08); border-color: rgba(184, 134, 11, 0.30); color: var(--warn, #b8860b); }
-.probe-line--warn .probe-line__dot { background: var(--warn, #b8860b); }
-@media (prefers-reduced-motion: reduce) {
-  .probe-line--busy .probe-line__dot { animation: none; }
-}
+.notice--warn b { color: #a86a12; }
+.notice__list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 4px; }
+.notice__item { display: flex; gap: 12px; font-size: 12.5px; line-height: 1.65; color: var(--muted); }
+.notice__item b { color: var(--blue-900); font-weight: 600; }
+.notice__key { flex: 0 0 88px; font-weight: 600; color: var(--blue-900); }
 .field { display: flex; flex-direction: column; gap: 7px; margin-bottom: 15px; }
 .field__label { font-size: 12px; color: var(--muted); font-weight: 600; }
 .link-row { display: flex; gap: 8px; align-items: center; }

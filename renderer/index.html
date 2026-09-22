@@ -62,7 +62,7 @@
     <section class="actions">
       <button id="btn-oauth" class="btn btn--primary btn--lg" title="打开 bigmodel.cn 登录页。手机号、获取验证码、人机验证、填验证码由你在窗口里完成；填好后面板会自动点「登录 / 注册」，并自动完成授权确认。">BigModel 网页登录</button>
       <button id="btn-oauth-link" class="btn btn--ghost btn--lg">浏览器授权导入</button>
-      <button id="btn-oauth-zai" class="btn btn--ghost btn--lg" title="打开 chat.z.ai 注册页。名称、邮箱、密码、人机验证由你在窗口里完成；填好后面板会自动点「创建账号」，激活链接需要你到邮箱里复制粘贴回来。访问国际版需要加速器，打开前会实测出口地区。">Z.ai 邮箱注册</button>
+      <button id="btn-oauth-zai" class="btn btn--ghost btn--lg btn--dead" title="Z.ai 邮箱注册通道已被官方关闭，这条线已失效。点开可以看到说明和替代做法。">Z.ai 邮箱注册<span class="btn__badge">已失效</span></button>
       <button id="btn-capture" class="btn btn--ghost btn--lg" title="把当前登录态记到账号库里。如果旧的全局 ~/.zcode 里还有登录态，会一并迁移进来。">捕获当前登录</button>
       <button id="btn-calibrate" class="btn btn--ghost btn--lg">校准注册时间</button>
       <button id="btn-rollback" class="btn btn--ghost btn--lg" title="按当前账号重启一次客户端。新架构下切换账号不再覆盖任何凭据，所以没有需要回滚的动作。">重启客户端</button>
@@ -147,20 +147,32 @@
   </div>
 
   <div id="zai-modal" class="modal hidden">
-    <div class="modal__box">
-      <h2>走 Z.ai 邮箱注册</h2>
-      <p class="modal__hint">这条线访问的是 <b>chat.z.ai</b>。请把加速器切到 <b>全局模式</b>并连到境外节点——规则/PAC 模式只代理浏览器，这里的窗口不走它。</p>
-      <p class="modal__hint">只有访问到国际版 Z.ai，注册出来的账号才是纯 Z.ai 账号，<b>不需要再绑 BigModel</b>。没连上国际版时页面上不会出现邮箱注册入口，流程会在「切到注册表单」那一步停下。</p>
+    <div class="modal__box modal__box--wide">
+      <h2>Z.ai 邮箱注册已失效</h2>
 
-      <div id="zai-probe" class="probe-line">
-        <span class="probe-line__dot"></span>
-        <span id="zai-probe-text" class="probe-line__text">打开时会自动检测这扇窗口的实际出口</span>
-        <button id="zai-probe-again" class="btn btn--ghost btn--mini">重新检测</button>
+      <div class="notice notice--warn">
+        <b>官方已经关闭了邮箱注册通道。</b>
+        <span>chat.z.ai 上不再提供邮箱注册入口，这条线无法再注册新账号。这不是面板的故障，也不是网络或加速器的问题——换节点、改地区都绕不过去。</span>
+      </div>
+
+      <div class="notice__list">
+        <div class="notice__item">
+          <span class="notice__key">已经注册过的</span>
+          <span>不受影响。列表里的 Z.ai 账号照常切换、启动、查额度。</span>
+        </div>
+        <div class="notice__item">
+          <span class="notice__key">要加新账号</span>
+          <span>用 <b>BigModel 网页登录</b>（手机号 + 短信验证码）。这条路新增的账号同样能用，不需要再单独注册 Z.ai。</span>
+        </div>
+        <div class="notice__item">
+          <span class="notice__key">手上已有账号</span>
+          <span>用 <b>浏览器授权导入</b>，把浏览器里已登录的账号凭据导进面板。</span>
+        </div>
       </div>
 
       <div class="modal__actions">
-        <button id="zai-cancel" class="btn btn--ghost">取消</button>
-        <button id="zai-continue" class="btn btn--primary">开始注册</button>
+        <button id="zai-close" class="btn btn--ghost">知道了</button>
+        <button id="zai-bigmodel" class="btn btn--primary">改用 BigModel 网页登录</button>
       </div>
     </div>
   </div>

@@ -508,65 +508,18 @@ function afterOAuthSuccess(res) {
   renderSession({ silent: true });
 }
 
-// 出口地区检测。放在弹窗里而不是只写在说明里，是因为「我开了加速器」
-// 和「这扇 Electron 窗口真的走出去了」是两件事——PAC/规则模式下窗口是直连的。
-let zaiProbeBusy = false;
-// null = 还没测出来 / 检测中。只有明确测到境外才放行，其余一律再问一次。
-let zaiEgressDomestic = null;
-
-function setProbeLine(kind, text) {
-  const line = $('#zai-probe');
-  const txt = $('#zai-probe-text');
-  if (line) line.className = 'probe-line' + (kind ? ' probe-line--' + kind : '');
-  if (txt) txt.textContent = text;
-}
-
-async function probeZaiEgress() {
-  if (zaiProbeBusy) return;
-  zaiProbeBusy = true;
-  zaiEgressDomestic = null;
-  setProbeLine('busy', '正在检测这扇窗口的实际出口…');
-  try {
-    const r = await api.oauthProbeRegion('zai');
-    if (!r || !r.ok) {
-      setProbeLine('warn', `检测不到（${(r && r.msg) || '未知'}）。多半是没走代理——请把加速器切到全局模式`);
-      return;
-    }
-    const where = `${r.country}${r.ip ? ' · ' + r.ip : ''}`;
-    zaiEgressDomestic = !!r.domestic;
-    if (r.domestic) setProbeLine('bad', `出口 ${where} —— 还是直连，全局模式没生效或节点不在境外`);
-    else setProbeLine('ok', `出口 ${where} —— 线路在境外，可以注册纯 Z.ai 账号`);
-  } catch (e) {
-    setProbeLine('warn', '检测异常：' + ((e && e.message) || '未知'));
-  } finally {
-    zaiProbeBusy = false;
-  }
-}
-
+// Z.ai 邮箱注册通道已被官方关闭（chat.z.ai 上不再提供邮箱注册入口），这条线走不通了。
+//
+// 所以这里不再探测出口地区、也不再发起任何注册流程，只把情况说清楚，并给出仍然能用的两条路。
+// 出口探测原本是为了提醒「加速器只代理浏览器、这扇窗口其实在直连」，通道没了它也就没有意义。
+//
+// 按钮与弹窗都保留：老版本用过的人会回来找它，直接删掉只会让人以为功能藏起来了。
 async function openZaiModal() {
   $('#zai-modal').classList.remove('hidden');
-  await probeZaiEgress();
 }
 
 function closeZaiModal() {
   $('#zai-modal').classList.add('hidden');
-}
-
-/**
- * 出口还在国内时拦一次。
- *
- * 不是禁止——万一你的代理只在浏览器里生效，仍可能想试。但必须先告诉你：
- * 这一步走错要白费一次人机验证和一个邮箱，最后只换来一个要补绑 BigModel 的账号。
- */
-function continueZaiAfterProbe() {
-  if (zaiEgressDomestic !== false) {
-    const reason = zaiEgressDomestic === true
-      ? '检测到当前出口还在国内。'
-      : '还没测出出口地区。';
-    if (!confirm(`${reason}继续的话，注册大概率拿不到国际版 Z.ai 账号，可能要额外补绑 BigModel。\n\n仍要继续？`)) return;
-  }
-  closeZaiModal();
-  doOAuth('zai');
 }
 
 async function doOAuth(which) {
@@ -1121,9 +1074,12 @@ function bindEvents() {
   // Z.ai 那条线必须先连上国际版，否则注册不出纯 Z.ai 账号——用弹窗说清楚，
   // 而不是等流程跑到「切注册表单」失败再让人猜原因。
   on('#btn-oauth-zai', 'click', openZaiModal);
-  on('#zai-cancel', 'click', closeZaiModal);
-  on('#zai-continue', 'click', continueZaiAfterProbe);
-  on('#zai-probe-again', 'click', probeZaiEgress);
+  on('#zai-close', 'click', closeZaiModal);
+  // 说明弹窗里给一条立刻能走的路：直接转到唯一还开着的注册通道
+  on('#zai-bigmodel', 'click', () => {
+    closeZaiModal();
+    doOAuth('bigmodel');
+  });
   on('#zai-modal', 'click', (e) => {
     if (e.target === $('#zai-modal')) closeZaiModal();
   });
