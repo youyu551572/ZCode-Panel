@@ -2391,11 +2391,12 @@ ipcMain.handle('balance:fetch', (_e, force) => balance.fetchBalance(force));
 //   ① <a href> 会让面板自己的窗口导航走，整个界面没了；
 //   ② window.open 在没注册 setWindowOpenHandler 的情况下会开出第二个 Electron 窗口，
 //      应该由使用者的浏览器来开。
-// 为什么带白名单：跳转目标在渲染层是被拼出来的字符串，这里收口成「只认这两条」，
+// 为什么带白名单：跳转目标在渲染层是被拼出来的字符串，这里收口成「只认下面这几条」，
 // 免得任何一处被注入的内容都能当成跳板去开任意 URL。
 const OPEN_URL_ALLOW = [
   { origin: 'https://www.bilibili.com', path: '/video/BV1i2eS69E3z' },
   { origin: 'https://github.com', path: '/youyu551572/ZCode-Panel' },
+  { origin: 'https://youyuaiwan.xyz', path: '/free.html' },
 ];
 
 ipcMain.handle('app:open-url', async (_e, raw) => {

@@ -9,10 +9,11 @@ const $ = (s) => document.querySelector(s);
 
 const FRESH_LIMIT_DAYS = 1;
 
-// 侧栏底部的两个外链。地址在这里集中一份，真正能不能开由主进程白名单说了算。
+// 面板里的外部链接。地址在这里集中一份，真正能不能开由主进程白名单说了算。
 const LINKS = {
   triple: 'https://www.bilibili.com/video/BV1i2eS69E3z/?share_source=copy_web&vd_source=a7371052883da345eff9c7f52427819b',
   repo: 'https://github.com/youyu551572/ZCode-Panel',
+  freePool: 'https://youyuaiwan.xyz/free.html',
 };
 
 /** 交给系统默认浏览器打开外链；被主进程白名单拒了就明确说一声，不静默失败 */
@@ -1122,6 +1123,7 @@ function bindEvents() {
   on('#btn-settings', 'click', () => openSettings(false));
   on('#btn-triple', 'click', () => openExternal(LINKS.triple, '一键三连'));
   on('#btn-repo', 'click', () => openExternal(LINKS.repo, '开源项目地址'));
+  on('#btn-free-pool', 'click', () => openExternal(LINKS.freePool, '免费号池'));
   on('#set-close', 'click', closeSettings);
   on('#set-save', 'click', doSettingsSave);
   on('#set-exe-pick', 'click', doSettingsPickExe);

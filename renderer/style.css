@@ -531,6 +531,16 @@ body {
   color: var(--bad);
   border: 1px solid rgba(225, 85, 75, 0.28);
 }
+/* 免费号池：绿色，和蓝色主操作、红色一键三连区分开，一眼认得出是「领号」入口 */
+.btn--free {
+  background: linear-gradient(135deg, #2fbf85, #15966a);
+  color: #fff;
+  box-shadow: 0 8px 18px rgba(21, 150, 106, 0.30);
+  gap: 6px;
+}
+.btn--free:hover { transform: translateY(-1px); box-shadow: 0 12px 26px rgba(21, 150, 106, 0.40); }
+.btn--free:focus-visible { outline-color: #15966a; }
+.btn__icon { width: 14px; height: 14px; flex-shrink: 0; }
 
 /* 工具栏按钮：紧凑尺寸，必须声明在 .btn 之后，否则被基础样式覆盖 */
 .btn--lg {
