@@ -1,0 +1,15 @@
+{
+  "name": "zcode-panel",
+  "version": "1.0.0",
+  "description": "ZCode 多账号管理面板",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  }
+}

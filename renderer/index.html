@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+<title>ZCode Panel</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="ambient ambient--a"></div>
+  <div class="ambient ambient--b"></div>
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand__logo">Z</div>
+      <div>
+        <div class="brand__name">ZCode Panel</div>
+        <div class="brand__sub">Account Manager</div>
+      </div>
+    </div>
+
+    <div class="side-card current-card">
+      <div class="side-label">当前账号</div>
+      <div id="current-user" class="current-user">读取中…</div>
+      <div id="current-status" class="current-status">--</div>
+    </div>
+
+    <div class="side-card plan-card">
+      <div class="quota__head">
+        <div class="side-label">套餐与额度</div>
+        <button id="btn-quota-refresh" class="btn btn--ghost btn--mini">刷新</button>
+      </div>
+      <div id="quota-updated" class="quota__updated">读取中…</div>
+      <div id="quota-grid" class="quota__grid"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar__title">
+        <h1>账号管理</h1>
+        <p id="meta-line">每个账号有自己独立的 ZCode 数据目录，切换即启动对应的那一份，互不覆盖</p>
+      </div>
+      <div class="topbar__actions">
+        <span id="sync-state" class="sync-state">已同步</span>
+        <button id="btn-refresh" class="btn btn--ghost">刷新</button>
+        <button id="btn-settings" class="btn btn--ghost" title="设置 ZCode 客户端位置与账号数据目录">设置</button>
+      </div>
+    </header>
+
+    <section class="actions">
+      <button id="btn-oauth" class="btn btn--primary btn--lg" title="打开 bigmodel.cn 登录页。手机号、获取验证码、人机验证、填验证码由你在窗口里完成；填好后面板会自动点「登录 / 注册」，并自动完成授权确认。">BigModel 网页登录</button>
+      <button id="btn-oauth-link" class="btn btn--ghost btn--lg">浏览器授权导入</button>
+      <button id="btn-oauth-zai" class="btn btn--ghost btn--lg" title="打开 chat.z.ai 注册页。名称、邮箱、密码、人机验证由你在窗口里完成；填好后面板会自动点「创建账号」，激活链接需要你到邮箱里复制粘贴回来。访问国际版需要加速器，打开前会实测出口地区。">Z.ai 邮箱注册</button>
+      <button id="btn-capture" class="btn btn--ghost btn--lg" title="把当前登录态记到账号库里。如果旧的全局 ~/.zcode 里还有登录态，会一并迁移进来。">捕获当前登录</button>
+      <button id="btn-calibrate" class="btn btn--ghost btn--lg">校准注册时间</button>
+      <button id="btn-rollback" class="btn btn--ghost btn--lg" title="按当前账号重启一次客户端。新架构下切换账号不再覆盖任何凭据，所以没有需要回滚的动作。">重启客户端</button>
+    </section>
+
+    <div class="sess-strip">
+      <span class="sess-strip__title">授权会话</span>
+      <span id="sess-info" class="sess-info">检测中…</span>
+      <button id="btn-sess-reset" class="btn btn--ghost btn--mini"
+              title="清空面板内置浏览器里的 bigmodel.cn / chat.z.ai 登录态。每次授权前会自动清一次，避免新号绑到上一个 BigModel 账号">清空会话</button>
+    </div>
+
+    <div class="proxy-strip">
+      <span class="proxy-strip__title">ZCode 代理</span>
+      <span id="proxy-state" class="proxy-state">读取中…</span>
+      <button id="btn-proxy-auto" class="btn btn--ghost btn--mini"
+              title="读取 Windows 系统代理并写入 ZCode 配置。ZCode 默认给主会话下发 direct，会主动绕过系统代理，所以必须写进它自己的配置才生效">用系统代理</button>
+      <button id="btn-proxy-clear" class="btn btn--ghost btn--mini"
+              title="清掉 ZCode 的 httpProxy，恢复它默认的直连行为">清除</button>
+    </div>
+
+    <div class="driver-strip">
+      <div class="driver-strip__head">
+        <span class="driver-strip__title">自动化流程</span>
+        <button id="btn-driver-log-clear" class="btn btn--ghost btn--mini" title="清空下方流程记录，不影响账号与额度">清空日志</button>
+      </div>
+      <div id="manual-strip" class="manual-strip hidden">
+        <span class="manual-strip__dot"></span>
+        <span class="manual-strip__label">需要你操作</span>
+        <span id="manual-msg" class="manual-strip__msg"></span>
+      </div>
+      <div id="driver-log" class="driver-log"></div>
+    </div>
+
+    <div class="scroll-area">
+      <section id="account-grid" class="grid"></section>
+    </div>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <div id="capture-modal" class="modal hidden">
+    <div class="modal__box">
+      <h2>保存账号快照</h2>
+      <p class="modal__hint">把当前登录态存成一份快照，之后可随时切回。</p>
+      <div class="field">
+        <span class="field__label">账号名称</span>
+        <input id="capture-name" class="input" placeholder="账号名称，如 acct01" maxlength="30" />
+      </div>
+      <label class="check"><input id="capture-replace" type="checkbox" /> 覆盖已有快照</label>
+      <div class="modal__actions">
+        <button id="capture-cancel" class="btn btn--ghost">取消</button>
+        <button id="capture-ok" class="btn btn--primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="link-modal" class="modal hidden">
+    <div class="modal__box modal__box--wide">
+      <h2>浏览器授权导入</h2>
+      <p class="modal__hint">在你已登录 bigmodel.cn 的浏览器里打开下面这条链接，完成授权后把地址栏里跳转的地址（或只把其中的 code）粘贴回来。</p>
+
+      <div class="field">
+        <span class="field__label">授权链接</span>
+        <div class="link-row">
+          <input id="link-url" class="input input--mono" readonly placeholder="点右侧按钮生成" />
+          <button id="link-copy" class="btn btn--ghost btn--mini-inline">复制</button>
+          <button id="link-open" class="btn btn--ghost btn--mini-inline">打开</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <span class="field__label">回跳地址 / 授权码</span>
+        <input id="link-code" class="input input--mono" placeholder="zcode://oauth/callback?code=...&state=..." />
+      </div>
+
+      <div class="modal__actions">
+        <button id="link-cancel" class="btn btn--ghost">取消</button>
+        <button id="link-submit" class="btn btn--primary">完成导入</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="zai-modal" class="modal hidden">
+    <div class="modal__box">
+      <h2>走 Z.ai 邮箱注册</h2>
+      <p class="modal__hint">这条线访问的是 <b>chat.z.ai</b>。请把加速器切到 <b>全局模式</b>并连到境外节点——规则/PAC 模式只代理浏览器，这里的窗口不走它。</p>
+      <p class="modal__hint">只有访问到国际版 Z.ai，注册出来的账号才是纯 Z.ai 账号，<b>不需要再绑 BigModel</b>。没连上国际版时页面上不会出现邮箱注册入口，流程会在「切到注册表单」那一步停下。</p>
+
+      <div id="zai-probe" class="probe-line">
+        <span class="probe-line__dot"></span>
+        <span id="zai-probe-text" class="probe-line__text">打开时会自动检测这扇窗口的实际出口</span>
+        <button id="zai-probe-again" class="btn btn--ghost btn--mini">重新检测</button>
+      </div>
+
+      <div class="modal__actions">
+        <button id="zai-cancel" class="btn btn--ghost">取消</button>
+        <button id="zai-continue" class="btn btn--primary">开始注册</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="ask-modal" class="modal hidden">
+    <div class="modal__box">
+      <h2 id="ask-label">请输入</h2>
+      <p id="ask-hint" class="modal__hint hidden"></p>
+      <div class="field">
+        <input id="ask-input" class="input input--mono" autocomplete="off" />
+      </div>
+      <div class="modal__actions">
+        <button id="ask-cancel" class="btn btn--ghost">取消</button>
+        <button id="ask-submit" class="btn btn--primary">提交</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal__box modal__box--wide">
+      <h2>设置</h2>
+      <p class="modal__hint">面板靠这些路径找到 ZCode 客户端、保存账号快照。换了电脑、换了用户名或改了安装位置，在这里指定一次即可。</p>
+
+      <div id="setup-warn" class="setup-warn hidden">
+        <strong>没找到 ZCode 客户端。</strong>
+        <span>切换账号、启动客户端都依赖它。请点「自动检测」，或在下面手动指定 ZCode.exe 的完整路径。</span>
+      </div>
+
+      <div class="field">
+        <div class="field__row">
+          <span class="field__label">ZCode 主程序</span>
+          <span id="exe-status" class="status-chip status-chip--idle">检测中…</span>
+        </div>
+        <div class="link-row">
+          <input id="set-exe" class="input input--mono" placeholder="C:\Users\你的用户名\AppData\Local\Programs\ZCode\ZCode.exe" />
+          <button id="set-exe-pick" class="btn btn--ghost btn--mini-inline">浏览…</button>
+        </div>
+        <span id="exe-hint" class="field__hint"></span>
+        <div class="link-row">
+          <button id="set-exe-detect" class="btn btn--ghost btn--mini-inline">自动检测</button>
+          <button id="set-exe-apply" class="btn btn--ghost btn--mini-inline">填入检测到的路径</button>
+        </div>
+      </div>
+
+      <div id="detect-log" class="detect-log hidden"></div>
+
+      <div class="field">
+        <span class="field__label">账号数据目录</span>
+        <div class="link-row">
+          <input id="set-accounts" class="input input--mono" placeholder="留空则用面板目录下的 accounts" />
+          <button id="set-acc-pick" class="btn btn--ghost btn--mini-inline">浏览…</button>
+          <button id="set-acc-default" class="btn btn--ghost btn--mini-inline">恢复默认</button>
+        </div>
+        <span id="acc-hint" class="field__hint"></span>
+      </div>
+
+      <div class="field">
+        <span class="field__label">配置文件</span>
+        <div class="link-row">
+          <input id="set-file" class="input input--mono" readonly />
+          <button id="set-open-folder" class="btn btn--ghost btn--mini-inline">打开目录</button>
+        </div>
+      </div>
+
+      <div class="modal__actions">
+        <button id="set-close" class="btn btn--ghost">关闭</button>
+        <button id="set-save" class="btn btn--primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 必须放在所有弹窗之后：bindEvents() 用 querySelector 取元素，
+       脚本提前执行的话后出现的弹窗元素还没解析出来，绑定会被静默跳过 -->
+  <script src="app.js"></script>
+</body>
+</html>

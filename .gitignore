@@ -1,0 +1,13 @@
+# 依赖与构建产物
+node_modules/
+dist/
+out/
+
+# 账号快照：含明文登录凭据，绝不能进版本库
+accounts/
+
+# 运行时状态
+*.log
+._*.js
+.DS_Store
+Thumbs.db
