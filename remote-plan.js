@@ -18,6 +18,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const settings = require('./settings');
 
 const BIGMODEL_ORIGIN = 'https://bigmodel.cn';
 const ZCODE_ORIGIN = 'https://zcode.z.ai';
@@ -35,7 +36,16 @@ const REQUEST_TIMEOUT_MS = 12000;
 // 一旦服务端判定异常活动（code 3012），立即熔断：期间不再发任何请求。
 // 触发后整个账号/出口都可能被限，继续试探只会加重。
 const COOLDOWN_MS = 30 * 60 * 1000;
-const STATE_FILE = path.join(__dirname, '.remote-plan-state.json');
+
+// 状态文件必须落在**可写**位置。
+// 打包后 __dirname 在 resources\app.asar 里 —— 那是只读的虚拟归档，writeFileSync 会抛错，
+// 而 writeState 把错误吞了，表现是「熔断状态永远存不下来」：撞到服务端风控（code 3012）
+// 之后重启面板，30 分钟冷却直接丢失，又会继续打同一个接口。
+// 开发态仍写在源码目录，方便直接看。
+const STATE_FILE = path.join(
+  __dirname.includes('app.asar') ? settings.APP_DIR : __dirname,
+  '.remote-plan-state.json'
+);
 
 let lastCallAt = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -52,6 +62,8 @@ function readState() {
 
 function writeState(s) {
   try {
+    // 目录可能是刚装的机器上第一次写，先确保它在
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
     fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2), 'utf8');
   } catch {
     /* 写不进去也不影响主流程 */

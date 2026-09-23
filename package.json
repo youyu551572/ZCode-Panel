@@ -34,6 +34,8 @@
       "remote-plan.js",
       "login-driver.js",
       "update.js",
+      "session-index.js",
+      "import-account.js",
       "icon.ico",
       "renderer/**/*"
     ],

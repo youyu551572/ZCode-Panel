@@ -173,7 +173,9 @@ npm run dist
 | `ZCode-Panel-1.0.0-portable.exe` | 单文件绿色版，双击即用，方便发给别人 |
 | `win-unpacked/ZCode Panel.exe` | 解压好的目录版，启动更快（免去便携版每次解压到临时目录） |
 
-打包用的是**白名单**，只收 `main.js` / `preload.js` / `settings.js` / `oauth.js` / `balance.js` / `plan.js` / `remote-plan.js` / `login-driver.js` / `icon.ico` / `renderer/`。
+打包用的是**白名单**，只收 `main.js` / `preload.js` / `settings.js` / `oauth.js` / `balance.js` / `plan.js` / `remote-plan.js` / `login-driver.js` / `update.js` / `session-index.js` / `import-account.js` / `icon.ico` / `renderer/`。
+
+改完 `main.js` 的 `require` 记得回来同步这个列表 —— 白名单漏一个模块，打出来的 exe 一启动就是 `Cannot find module`。
 
 **`accounts/` 永远不进包** —— 那里面是真实登录凭据，而且它下面的 `cli/`、`workspace/` 还是指向 `~/.zcode` 的目录联接，一旦误收会把你的对话记录、插件一起打进 exe 里发出去。
 
@@ -219,7 +221,9 @@ login-driver.js   登录窗口自动化驱动（BigModel 手机号；Z.ai 邮箱
 oauth.js          OAuth 授权流程与凭据加解密
 balance.js        客户端日志里的额度读取
 plan.js           套餐额度解析（读该账号自己的日志）
-remote-plan.js    联网套餐查询
+remote-plan.js    联网套餐查询（含节流与 3012 熔断）
+session-index.js  会话索引同步（数据根隔离后，tasks-index.sqlite 需要在切换边界搬运）
+import-account.js 导入账号：把一份凭据变成面板里的一个可用账号（不依赖 electron，可单测）
 update.js         强制更新：版本比较与 GitHub Releases 检查（不依赖 electron，可单测）
 renderer/         界面（index.html / app.js / style.css）
 accounts/         账号数据目录（运行后生成，含登录凭据，不建议提交到版本库）

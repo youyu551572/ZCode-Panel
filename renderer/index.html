@@ -63,8 +63,10 @@
       <button id="btn-oauth" class="btn btn--primary btn--lg" title="打开 bigmodel.cn 登录页。手机号、获取验证码、人机验证、填验证码由你在窗口里完成；填好后面板会自动点「登录 / 注册」，并自动完成授权确认。">BigModel 网页登录</button>
       <button id="btn-oauth-link" class="btn btn--ghost btn--lg">浏览器授权导入</button>
       <button id="btn-free-pool" class="btn btn--free btn--lg" title="打开免费号池页面，可以领可用的 ZCode 账号。会在系统浏览器里打开 youyuaiwan.xyz。"><svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M21.41 11.58l-9-9A2 2 0 0 0 11 2H4a2 2 0 0 0-2 2v7a2 2 0 0 0 .59 1.42l9 9A2 2 0 0 0 13 22a2 2 0 0 0 1.41-.59l7-7A2 2 0 0 0 22 13a2 2 0 0 0-.59-1.42zM6.5 8A1.5 1.5 0 1 1 8 6.5 1.5 1.5 0 0 1 6.5 8z"/></svg>免费号池</button>
+      <button id="btn-shop" class="btn btn--ghost btn--lg" title="YouYu Shop：一元买一个可用账号。会在**面板内的小窗口**里打开，买完的账号自动进本面板的账号管理，回来就能切号用。"><svg class="btn__icon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 4V3a5 5 0 0 1 10 0v1h2.2a1 1 0 0 1 1 .9l1.2 14A2 2 0 0 1 19.4 21H4.6a2 2 0 0 1-2-2.1l1.2-14a1 1 0 0 1 1-.9H7zm2 0h6V3a3 3 0 0 0-6 0v1zm-1.8 4.5a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm9.6 0a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></svg>一元账号</button>
       <button id="btn-oauth-zai" class="btn btn--ghost btn--lg btn--dead" title="Z.ai 邮箱注册通道已被官方关闭，这条线已失效。点开可以看到说明和替代做法。">Z.ai 邮箱注册<span class="btn__badge">已失效</span></button>
       <button id="btn-capture" class="btn btn--ghost btn--lg" title="把当前登录态记到账号库里。如果旧的全局 ~/.zcode 里还有登录态，会一并迁移进来。">捕获当前登录</button>
+      <button id="btn-import-account" class="btn btn--ghost btn--lg" title="导入账号：把从小店买到的凭据 JSON（或 .json 文件）导进本面板，导完就能切号使用。">导入账号</button>
       <button id="btn-calibrate" class="btn btn--ghost btn--lg">校准注册时间</button>
       <button id="btn-rollback" class="btn btn--ghost btn--lg" title="按当前账号重启一次客户端。新架构下切换账号不再覆盖任何凭据，所以没有需要回滚的动作。">重启客户端</button>
     </section>
@@ -104,6 +106,28 @@
   </main>
 
   <div id="toast" class="toast"></div>
+
+  <div id="import-modal" class="modal hidden">
+    <div class="modal__box modal__box--wide">
+      <h2>导入账号</h2>
+      <p class="modal__hint">把从小店拿到的凭据 JSON 粘进来（或选择 .json 文件）。导入后会出现在账号管理里，可直接切号使用。</p>
+      <div class="field">
+        <span class="field__label">凭据 JSON</span>
+        <textarea id="import-text" class="input" rows="8" spellcheck="false"
+          placeholder='{"name":"acct01","jwt":"eyJ…","device_mid":"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"}'></textarea>
+      </div>
+      <div class="field">
+        <span class="field__label">或选择文件</span>
+        <input id="import-file" type="file" accept=".json,application/json,text/plain" />
+      </div>
+      <label class="check"><input id="import-replace" type="checkbox" /> 覆盖同名账号（默认不允许）</label>
+      <div id="import-result" class="modal__hint"></div>
+      <div class="modal__actions">
+        <button id="import-cancel" class="btn btn--ghost">取消</button>
+        <button id="import-ok" class="btn btn--primary">导入</button>
+      </div>
+    </div>
+  </div>
 
   <div id="capture-modal" class="modal hidden">
     <div class="modal__box">

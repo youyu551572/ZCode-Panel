@@ -60,6 +60,10 @@ contextBridge.exposeInMainWorld('zpanel', {
   openApp: () => ipcRenderer.invoke('app:open'),
   // 外链一律交给系统默认浏览器打开（主进程侧带地址白名单校验）
   openUrl: (url) => ipcRenderer.invoke('app:open-url', url),
+  // 【有鱼小店】在面板内的**小窗口浏览器**里打开（不是系统浏览器）
+  openShop: (url) => ipcRenderer.invoke('shop:open', url),
+  // 【导入账号】把从小店拿到的凭据导进本面板（B 方案：小店给凭据，面板来导入）
+  importAccount: (payload, opts) => ipcRenderer.invoke('accounts:import', payload, opts),
   quitApp: () => ipcRenderer.invoke('app:quit'),
   // 强制更新：检查 GitHub Releases，有新版就要求先更新
   updateCheck: () => ipcRenderer.invoke('update:check'),

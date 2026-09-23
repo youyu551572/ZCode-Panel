@@ -23,6 +23,16 @@ const HOME = os.homedir();
 const LEGACY_ZCODE_ROOT = path.join(HOME, '.zcode');
 const LEGACY_ZCODE_V2 = path.join(LEGACY_ZCODE_ROOT, 'v2');
 
+// 【移植】会话/任务索引跨账号同步 —— 修「切号后我那些会话记录不见了」。
+// 数据根隔离把 <账号>/data/.zcode/v2 整个隔开，而 tasks-index.sqlite
+// （客户端任务列表 / 会话索引）正好在 v2 里 → 客户端只看到本账号那个几乎空的库。
+// 详见 session-index.js 头部注释，以及 launchZCode 里的调用点。
+const sessionIndex = require('./session-index');
+
+// 【YouYu Shop / 导入账号】把一份凭据变成本面板里的一个可用账号。
+// 逻辑单独放 import-account.js —— 它能脱离 electron 单独测试（校验/拒绝/落盘都跑过）。
+const accountImporter = require('./import-account');
+
 // ZCode 客户端的位置和账号库都由 settings 模块决定：先自动多源探测，找不到就让
 // 使用者在设置页手动指定。不同机器上盘符、用户名、安装目录都不一样，不能写死。
 // 账号库优先级：设置页指定 > ZPANEL_ACCOUNTS_DIR 环境变量 > 面板目录下的 accounts/。
@@ -349,6 +359,24 @@ function flattenPlanItems(planData) {
   });
 }
 
+/**
+ * 计划级的元信息：起止时间 + 生效状态。
+ *
+ * 单独抽出来是因为快照（plan-snapshot.json）里 items 只存额度桶，
+ * 而「有效期至 …」取自 endsAt —— 它属于计划本身，不属于某个桶。
+ * 以前写快照时没带上它，回读时又硬编码成 null，表现就是
+ * **没跑过客户端的新账号只显示「有效期至 --」**（日志路径有值，快照路径没有）。
+ */
+function planMetaOf(planData) {
+  return (planData && planData.plans ? planData.plans : []).map((p) => ({
+    name: p.name || p.planId || '套餐',
+    startsAt: p.startsAt || null,
+    endsAt: p.endsAt || null,
+    pending: !!p.pending,
+    expired: !!p.expired,
+  }));
+}
+
 // ZCode 主进程启动时间。
 // 必须异步取：在 Electron 主进程里用 execSync 调外部程序会阻塞事件循环，
 // 实测直接把整个应用卡死（连 CDP 都不再响应）。这里只在后台刷新，读值永远不阻塞。
@@ -419,6 +447,7 @@ function writePlanSnapshot(planData) {
     provider_id: planData.providerId || null,
     user_plan_id: planData.userPlanId || null,
     user_id: (cur && cur.user_id) || null,
+    plans: planMetaOf(planData),
     items: flattenPlanItems(planData),
   };
   try {
@@ -454,22 +483,33 @@ function snapshotToPlanData(accountId) {
   const snap = safeJson(path.join(accountsDir(), accountId, SNAPSHOT_FILE));
   if (!snap || !Array.isArray(snap.items) || !snap.items.length) return null;
 
+  // 计划级日期从 snap.plans 取。老快照没有这个字段 → 退回 null，行为与以前一致。
+  const metaByName = new Map();
+  for (const p of (Array.isArray(snap.plans) ? snap.plans : [])) {
+    if (p && p.name) metaByName.set(p.name, p);
+  }
+
   const byPlan = new Map();
   for (const it of snap.items) {
     const key = it.plan || '套餐';
     if (!byPlan.has(key)) {
+      const meta = metaByName.get(key) || {};
+      const endsAt = meta.endsAt || null;
+      // expired 按**读取时刻**重算：快照可能是几天前存的，
+      // 当时还没过期不代表现在还没过期（plan.js 里也是这么算的）。
+      const endsMs = endsAt ? Date.parse(String(endsAt).replace(' ', 'T')) : NaN;
       byPlan.set(key, {
         planId: null,
         userPlanId: null,
         name: key,
         description: null,
         status: null,
-        startsAt: null,
-        endsAt: null,
+        startsAt: meta.startsAt || null,
+        endsAt,
         entitlements: [],
         buckets: [],
-        pending: false,
-        expired: false,
+        pending: !!meta.pending,
+        expired: Number.isFinite(endsMs) ? endsMs < Date.now() : !!meta.expired,
       });
     }
     const pl = byPlan.get(key);
@@ -562,6 +602,7 @@ async function fetchRemotePlanForAccount(id) {
     log_ts: normalized.logTs || null,
     provider_id: normalized.providerId || null,
     user_plan_id: normalized.userPlanId || null,
+    plans: planMetaOf(normalized),
     items: flattenPlanItems(normalized),
   };
   if (!snap.items.length) return { ok: false, reason: 'empty', msg: '服务端返回里没有可显示的额度' };
@@ -1081,6 +1122,18 @@ function launchZCode(accountId) {
     const root = dataRootOf(accountId);
     try { fs.mkdirSync(root, { recursive: true }); } catch (_) {}
     env.ZCODE_DATA_BASE_DIR = root;
+
+    // ①-a 【移植】会话/任务索引同步：共享 → 账号（进入前）。
+    //      必须在客户端启动**之前**调用（此时旧客户端已退出，见各处 killZCode）。
+    //      模块内部会先把上一次播种过的账号回写进共享库，所以这里只需一处。
+    //      症状修复：使用者报「我项目那些会话记录不见了」——
+    //      根因就是数据根隔离把 tasks-index.sqlite 也隔开了。
+    try {
+      const note = sessionIndex.syncIn(path.join(root, '.zcode', 'v2'), LEGACY_ZCODE_V2, accountId);
+      console.log('[session-index] 播种 ' + accountId + '：' + note);
+    } catch (e) {
+      console.warn('[session-index] 播种失败：' + (e.message || e));
+    }
 
     // ①-b 但项目 / 会话 / 插件是使用者的东西，要跨账号共用，
     //     否则切过来会看到一个空的项目列表（凭据隔离不该把它们也隔离掉）。
@@ -2125,6 +2178,99 @@ function handleOAuthCallback(url) {
 
 let win = null;
 
+// 【YouYu Shop】面板内的**小窗口浏览器**。
+// 为什么不用系统浏览器：小店买完要把账号交回本面板账号管理，得有一个我们可控的窗口；
+// 560×780 是"顺手买一个"的尺寸，不占满屏、不打断面板上的操作。
+let shopWin = null;
+// 【导入账号】面板侧唯一收外部凭据的入口（YouYu Shop那条 B 方案：小店给凭据，面板来导入）。
+// 校验与落盘全在 import-account.js：名字白名单、jwt 三段、device_mid 必须 UUID、
+// 默认拒绝覆盖同名账号 —— 主进程这边只负责挑一份模板（让写出来的 config 与现成账号同形）。
+ipcMain.handle('accounts:import', async (_e, payload, opts) => {
+  try {
+    let template = null;
+    try {
+      const list = await listAccounts();
+      for (const a of list) {
+        const c = readJsonAt(configOf(a.id));
+        if (c && c.provider && Object.keys(c.provider).some((k) => k.startsWith('builtin:'))) { template = c; break; }
+      }
+    } catch (e) { /* 取不到模板就走最小 config，不阻断导入 */ }
+    const r = accountImporter.importAccount({
+      payload,
+      accountsDir: accountsDir(),
+      encrypt: oauth.encrypt,
+      template,
+      replace: !!(opts && opts.replace),
+    });
+    if (r.ok) console.log('[accounts:import] 已导入 ' + r.id + '（provider ' + (r.providers || []).length + ' 个）');
+    return r;
+  } catch (e) {
+    return { ok: false, error: 'exception', msg: (e && e.message) || String(e) };
+  }
+});
+
+ipcMain.handle('shop:open', async (_e, url) => {
+  const u = String(url || '').trim();
+  // https 随便；http **只放行回环地址**（本地测试那套 127.0.0.1:8790）。
+  // 一开始写成"只允许 https"，结果本地测试被自己拦掉了 —— 这类限制要留本地口子。
+  // 用 URL 解析而不是正则：写法直白、不会踩转义坑（`\/|$` 那种一不小心就写错）。
+  // 允许 http 的白名单主机：回环（本地测试）+ 自己的站点域名（小店部署在公网、
+  // 暂时只用端口没上 TLS）。**只列自己的域名** —— 陌生 http 站点、file:、javascript: 一律拒。
+  const HTTP_OK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]', 'youyuaiwan.xyz', 'www.youyuaiwan.xyz']);
+  let allow = false;
+  try {
+    const p = new URL(u);
+    const host = String(p.hostname || '').toLowerCase();
+    allow = p.protocol === 'https:' || (p.protocol === 'http:' && HTTP_OK_HOSTS.has(host));
+  } catch (e) { allow = false; }
+  if (!allow) return { ok: false, msg: '只允许 https，或本机回环 / youyuaiwan.xyz 的 http 地址' };
+  try {
+    if (shopWin && !shopWin.isDestroyed()) {
+      await shopWin.loadURL(u);
+      shopWin.focus();
+      return { ok: true, reused: true };
+    }
+    shopWin = new BrowserWindow({
+      width: 560, height: 780, minWidth: 420, minHeight: 520,
+      parent: win && !win.isDestroyed() ? win : undefined,
+      title: 'YouYu Shop',
+      autoHideMenuBar: true,
+      resizable: true,
+      backgroundColor: '#f5f7fa',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        // 注意：这里**暂不挂 preload**。等"买完自动导入面板"那条窄桥设计定下来
+        // 再挂，且必须在 preload 里校验来源 origin + 字段格式，不能把写目录能力裸奔给远端页面。
+      },
+    });
+    shopWin.on('closed', () => { shopWin = null; });
+    // 加载失败不要只给一张浏览器错误页 —— 明确告诉使用者该检查什么
+    shopWin.webContents.on('did-fail-load', (_ev, code, desc, failed) => {
+      const hint = String(failed || u);
+      const isLocal = /127\.0\.0\.1|localhost|\[::1\]/.test(hint);
+      const html = '<meta charset="utf-8"><body style="font:14px/1.7 system-ui,'
+        + '&quot;Microsoft YaHei&quot;,sans-serif;padding:24px;color:#1f2329;background:#f5f7fa">'
+        + '<h2 style="font-size:16px;margin:0 0 8px">打不开YouYu Shop</h2>'
+        + '<p style="color:#8a919f;margin:0 0 14px">' + hint.replace(/</g, '&lt;')
+        + '<br>' + String(desc || '') + '（' + code + '）</p>'
+        + (isLocal
+          ? '<p><b>这是本机地址，多半是小店没在跑。</b>先启动它：</p>'
+            + '<pre style="background:#0f1319;color:#d7e3f4;padding:10px;border-radius:8px">cd D:\\PYxiangmu\\youyu-shop&#10;start.cmd</pre>'
+          : '<p>确认这个地址已经部署、且能在外网打开。</p>')
+        + '<p style="color:#8a919f;margin-top:14px">地址要改的话：<code>renderer/app.js</code> 里的 '
+        + '<code>LINKS.shop</code>（改完重启面板）。</p>'
+        + '</body>';
+      try { shopWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html)); } catch (e) { /* 无妨 */ }
+    });
+    await shopWin.loadURL(u);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, msg: (e && e.message) || String(e) };
+  }
+});
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1080,
@@ -2341,6 +2487,7 @@ ipcMain.handle('plans:quota', async (_e, force) => {
 
   return data;
 });
+
 ipcMain.handle('plan:state', () => ({ cooldownMs: remotePlan.cooldownLeftMs() }));
 ipcMain.handle('plan:remote', async (_e, id) => {
   try {

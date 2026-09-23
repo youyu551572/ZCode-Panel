@@ -8,6 +8,9 @@ accounts/
 
 # 运行时状态
 *.log
-._*.js
+._*
 .DS_Store
 Thumbs.db
+
+# 本地验证脚本：不属于面板运行时，也不该进包
+_verify-*.js

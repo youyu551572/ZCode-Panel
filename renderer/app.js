@@ -14,6 +14,12 @@ const LINKS = {
   triple: 'https://www.bilibili.com/video/BV1i2eS69E3z/?share_source=copy_web&vd_source=a7371052883da345eff9c7f52427819b',
   repo: 'https://github.com/youyu551572/ZCode-Panel',
   freePool: 'https://youyuaiwan.xyz/free.html',
+  // YouYu Shop（一元买账号）。**在面板内的小窗口里打开**，不是系统浏览器 ——
+  // 这样以后小店页面能通过面板预留的窄桥把买到的账号直接交回面板账号管理。
+  //
+  // 现在指向**本机**：小店部署在服务器之前，本地点开就能用（先跑 YouYu Shop\start.cmd）。
+  // 部署到 youyuaiwan.xyz 之后，把这里改成 'https://youyuaiwan.xyz/shop/' 再重启面板。
+  shop: 'https://shop.youyuaiwan.xyz',
 };
 
 /** 交给系统默认浏览器打开外链；被主进程白名单拒了就明确说一声，不静默失败 */
@@ -262,6 +268,8 @@ function cdKeyOf() {
 }
 
 function refreshBtnHtml(a) {
+  // 只留「联网刷新」：它把服务端返回的套餐写进快照，卡片标签和侧栏的有效期都靠它更新。
+  // 冷却期内不给任何触发入口 —— billing 接口被判异常活动后继续试探只会加重限制。
   if (remoteCooldownMs > 0) {
     return `<button class="plan-refresh" disabled title="服务端此前判定异常活动，冷却期内不再发起请求">冷却 ${fmtCooldown(remoteCooldownMs)}</button>`;
   }
@@ -442,8 +450,7 @@ async function doPlanRemote(id, btn) {
   if (btn) {
     btn.disabled = true;
     btn.textContent = '查询中…';
-  }
-  const restore = () => {
+  }  const restore = () => {
     if (btn && btn.isConnected) {
       btn.disabled = false;
       btn.textContent = '联网刷新';
@@ -1177,6 +1184,62 @@ function bindEvents() {
   on('#btn-triple', 'click', () => openExternal(LINKS.triple, '一键三连'));
   on('#btn-repo', 'click', () => openExternal(LINKS.repo, '开源项目地址'));
   on('#btn-free-pool', 'click', () => openExternal(LINKS.freePool, '免费号池'));
+  // YouYu Shop：优先走**面板内小窗口**（小店页面能经窄桥把账号交回面板）；
+  // 小窗口起不来（比如主进程不支持）就退回系统浏览器，别让按钮点了没反应。
+  on('#btn-shop', 'click', async () => {
+    try {
+      const r = await api.openShop(LINKS.shop);
+      if (r && r.ok) return;
+      toast((r && r.msg) || '小窗口打开失败，已改用系统浏览器', false, 4200);
+    } catch (e) { /* 落到下面用系统浏览器 */ }
+    openExternal(LINKS.shop, 'YouYu Shop');
+  });
+
+  // ===== 导入账号（YouYu Shop B 方案：小店给凭据，面板来导入）=====
+  // 为什么不是"小店直接写面板目录"：小店是**部署在服务器上的网站**，它写不到买家本机。
+  // 所以由面板提供唯一入口，校验与落盘在 main 的 import-account.js 里（已单独测过 9 条拒绝分支）。
+  const importModal = () => $('#import-modal');
+  const importHint = (msg, ok) => {
+    const el = $('#import-result');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.style.color = ok ? '' : '#d4380d';
+  };
+  on('#btn-import-account', 'click', () => {
+    importHint('');
+    const t = $('#import-text'); if (t) t.value = '';
+    const f = $('#import-file'); if (f) f.value = '';
+    importModal().classList.remove('hidden');
+  });
+  on('#import-cancel', 'click', () => importModal().classList.add('hidden'));
+  on('#import-file', 'change', async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    try {
+      const text = await f.text();
+      $('#import-text').value = text;
+      importHint('已读入 ' + f.name + '，点「导入」', true);
+    } catch (err) { importHint('读文件失败：' + (err.message || err), false); }
+  });
+  on('#import-ok', 'click', async () => {
+    const text = ($('#import-text').value || '').trim();
+    if (!text) { importHint('先把凭据 JSON 粘进来（或选一个 .json 文件）', false); return; }
+    const btn = $('#import-ok'); btn.disabled = true;
+    try {
+      const replace = !!($('#import-replace') && $('#import-replace').checked);
+      const r = await api.importAccount(text, { replace });
+      if (r && r.ok) {
+        importHint('✓ 已导入「' + r.id + '」（provider ' + (r.providers || []).length + ' 个），账号管理里已可切号', true);
+        toast('已导入账号 ' + r.id, true);
+        await refresh();
+        setTimeout(() => importModal().classList.add('hidden'), 900);
+      } else {
+        importHint('导入失败：' + ((r && r.msg) || '未知错误'), false);
+      }
+    } catch (e) {
+      importHint('导入失败：' + (e.message || e), false);
+    } finally { btn.disabled = false; }
+  });
   on('#set-close', 'click', closeSettings);
   on('#set-save', 'click', doSettingsSave);
   on('#set-exe-pick', 'click', doSettingsPickExe);
