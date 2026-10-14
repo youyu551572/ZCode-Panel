@@ -1266,6 +1266,16 @@ async function switchAccount(id, opts = {}) {
   await killZCode();
   await wait(800);
 
+  // ①-c 上一个账号这轮的会话索引并回共享库。
+  //      必须在**客户端已退出**之后、写入 .current 之前做（此时才是安全窗口）。
+  //      以前只靠 launchZCode 里的 syncIn 顺带回写，而它依赖模块级变量记"上次播种了谁"，
+  //      面板一重启就归零 → 静默不回写 → 该账号新建的会话全留在私有库里。
+  //      现在标记落在磁盘上，这里显式回写一次，切号一定不丢会话记录。
+  if (prevId && prevId !== id) {
+    try { sessionIndex.syncOutAccount(prevId, LEGACY_ZCODE_V2, accountsDir()); }
+    catch (e) { console.warn('[session-index] 回写失败：' + (e.message || e)); }
+  }
+
   writeCurrentId(id);
   bumpSwitchMeta(dir, 'switch');
 
@@ -1356,6 +1366,20 @@ async function deleteAccount(id) {
   // 最后报一条「移除失败：EBUSY ... copyfile Cookies」，账号还留在原地。
   let killedClient = false;
   let lastErr = null;
+
+  // 【会话记录不回丢】删除前先把该账号这一轮的会话索引并回共享库。
+  // 不这么做的话，账号目录连同它私有库里的 tasks-index.sqlite 一起进回收站，
+  // 这个号在客户端里新建的会话就跟着消失了 —— 别处能看到的历史记录凭空少一截。
+  // 放在改名之前：此时目录还在，回写才读得到源。
+  try {
+    const note = sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir());
+    if (note && note !== 'not-seeded') console.log('[session-index] 删除前回写 ' + id + '：' + note);
+  } catch (e) {
+    // 回写失败不阻断删除：使用者的意图是移除账号，别因为会话回写卡住他。
+    // 但必须让他知道"这个号里的会话没能并回共享库"，否则事后无从解释。
+    console.warn('[session-index] 删除前回写失败：' + (e.message || e));
+  }
+
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       fs.renameSync(dir, dst);
@@ -1489,6 +1513,11 @@ async function rollback() {
 
   await killZCode();
   await wait(600);
+
+  // 同一账号重启也要先回写：这一轮在客户端里新建的会话此时只落在账号私有库，
+  // 不回写的话下次启动 syncIn 会用共享库盖掉它们（标记还在，走覆盖分支）。
+  try { sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
+  catch (e) { console.warn('[session-index] 回写失败：' + (e.message || e)); }
 
   let launchError = null;
   try {
@@ -3091,6 +3120,11 @@ ipcMain.handle('app:open', async () => {
   }
   await killZCode();
   await wait(500);
+
+  // 关客户端 → 立刻开机也要先回写，否则中间那段新建的会话只在账号私有库
+  try { sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
+  catch (e) { console.warn('[session-index] 回写失败：' + (e.message || e)); }
+
   try {
     await launchZCode(id);
     return { ok: true };
@@ -3099,7 +3133,14 @@ ipcMain.handle('app:open', async () => {
   }
 });
 ipcMain.handle('app:quit', async () => {
+  // 退出面板时把当前账号的会话索引并回共享库。
+  // 面板关掉之后没人再有机会做这件事，留着不回写 = 这一轮会话卡在账号私有库里。
+  const id = readCurrentId();
   await killZCode();
+  if (id) {
+    try { sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
+    catch (e) { console.warn('[session-index] 退出前回写失败：' + (e.message || e)); }
+  }
   return { ok: true };
 });
 
@@ -3132,5 +3173,28 @@ if (!app.requestSingleInstanceLock()) {
   });
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();
+  });
+
+  // 关面板这个动作本身也要回写一次会话索引。
+  //
+  // 上面的 window-all-closed 只是 app.quit()，走的不是 'app:quit' 那个 IPC ——
+  // 也就是说使用者点右上角「×」关面板时，之前那条回写路径完全不会执行。
+  // 而 ZCode 客户端通常还开着，会话正写在账号私有库里；下次再打开面板切号，
+  // syncIn 会用共享库把私有库盖掉（标记在，走覆盖分支）→ 这段会话就永久没了。
+  //
+  // 这里**必须同步做**：'before-quit' 之后事件循环随时会停，异步拷贝可能来不及落盘。
+  // 用最大努力语义：任何失败都吞掉，绝不能让关闭面板卡住或被一个异常打断。
+  app.on('before-quit', () => {
+    try {
+      const id = readCurrentId();
+      if (!id) return;
+      const dataV2 = path.join(accountsDir(), id, 'data', '.zcode', 'v2');
+      if (!fs.existsSync(path.join(dataV2, sessionIndex.MARK))) return;  // 没播种过 → 回写会拿子集覆盖全集
+      const note = sessionIndex.syncOut(dataV2, LEGACY_ZCODE_V2, id);
+      console.log('[session-index] 退出面板前回写 ' + id + '：' + note);
+    } catch (e) {
+      // 故意吞掉：退出路径上的异常会让面板关不干净，代价远大于丢一次回写
+      console.warn('[session-index] 退出面板前回写失败：' + ((e && e.message) || e));
+    }
   });
 }
