@@ -734,6 +734,40 @@ body {
 .modal__hint b { color: var(--blue-900); font-weight: 600; }
 .modal__hint + .modal__hint { margin-top: -6px; }
 
+/* 出口地区检测行（Z.ai 注册前用它确认这扇窗口真的从境外出去） */
+.probe-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 18px;
+  padding: 8px 11px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--blue-50);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.probe-line__dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.probe-line__text { flex: 1; min-width: 0; }
+.probe-line .btn { flex: 0 0 auto; padding: 2px 8px; font-size: 11px; }
+.probe-line--busy .probe-line__dot { background: var(--blue-500); animation: manual-dot 1.2s ease-in-out infinite; }
+.probe-line--ok { background: rgba(23, 148, 90, 0.08); border-color: rgba(23, 148, 90, 0.32); color: var(--ok); }
+.probe-line--ok .probe-line__dot { background: var(--ok); }
+.probe-line--bad { background: rgba(217, 48, 37, 0.07); border-color: rgba(217, 48, 37, 0.30); color: var(--bad); }
+.probe-line--bad .probe-line__dot { background: var(--bad); }
+.probe-line--warn { background: rgba(184, 134, 11, 0.08); border-color: rgba(184, 134, 11, 0.30); color: var(--warn, #b8860b); }
+.probe-line--warn .probe-line__dot { background: var(--warn, #b8860b); }
+@media (prefers-reduced-motion: reduce) {
+  .probe-line--busy .probe-line__dot { animation: none; }
+}
+
 /* 说明块：用于讲清「某个功能已经不能用了」这类需要完整交代的事 */
 .notice {
   display: flex;

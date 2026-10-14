@@ -14,3 +14,8 @@ Thumbs.db
 
 # 本地验证脚本：不属于面板运行时，也不该进包
 _verify-*.js
+
+# 抓包与测试产物：含真实手机号、上游 token，绝不进版本库
+capture-logs/
+helmd-cases/
+import-report.json

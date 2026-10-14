@@ -12,10 +12,43 @@ const balance = require('./balance');
 const plan = require('./plan');
 const remotePlan = require('./remote-plan');
 const { LoginDriver, ZaiMailDriver } = require('./login-driver');
+const chromeAuth = require('./chrome-auth');
 const settings = require('./settings');
 const update = require('./update');
 
 const HOME = os.homedir();
+
+/**
+ * 调试端口开关（默认关闭，显式开了才生效）。
+ *
+ * 为什么要它：面板内嵌的授权窗口就是 Chromium 的一个 page target，
+ * 开了本地调试端口后，外部工具（monitor-register.js --attach）就能挂上去
+ * 对**真实注册流程**做监控与抓包，不用另起一个浏览器。
+ *
+ * 三种开法（优先级从高到低）：
+ *   ZCODE_PANEL_DEBUG_PORT=9222        环境变量
+ *   --debug-port=9222                  启动参数
+ *   两者都不给 → 不监听任何端口
+ *
+ * 注意：这个端口只绑本机、无鉴权，任何人连上就能读页面内容。用完记得关。
+ */
+function resolveDebugPort() {
+  const fromEnv = Number(String(process.env.ZCODE_PANEL_DEBUG_PORT || '').trim());
+  if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
+  const arg = process.argv.find((a) => /^--debug-port=\d+$/.test(a));
+  if (arg) {
+    const n = Number(arg.split('=')[1]);
+    if (Number.isInteger(n) && n > 0 && n < 65536) return n;
+  }
+  return 0;
+}
+
+const PANEL_DEBUG_PORT = resolveDebugPort();
+if (PANEL_DEBUG_PORT) {
+  // 必须在 app ready 之前下发，Chromium 才认
+  app.commandLine.appendSwitch('remote-debugging-port', String(PANEL_DEBUG_PORT));
+  app.commandLine.appendSwitch('remote-allow-origins', '*');
+}
 
 // 老架构里的全局 ZCode 数据目录。现在有两处用途：
 //   ① 把使用者的旧登录态迁移进来；
@@ -32,6 +65,8 @@ const sessionIndex = require('./session-index');
 // 【YouYu Shop / 导入账号】把一份凭据变成本面板里的一个可用账号。
 // 逻辑单独放 import-account.js —— 它能脱离 electron 单独测试（校验/拒绝/落盘都跑过）。
 const accountImporter = require('./import-account');
+// 导出的逆操作：产出与导入完全同构的 JSON（复用导入方的正则做自检）
+const accountExporter = require('./export-account');
 
 // ZCode 客户端的位置和账号库都由 settings 模块决定：先自动多源探测，找不到就让
 // 使用者在设置页手动指定。不同机器上盘符、用户名、安装目录都不一样，不能写死。
@@ -971,18 +1006,39 @@ async function probeEgressRegion(provider = 'zai') {
  * 走 Electron 的 session API 而不是直接删目录：分区一旦被加载过就常驻内存，
  * Chromium 锁着 Cookies 和 leveldb，硬删会和运行中的进程打架。
  */
+/**
+ * 清授权会话时**保留**的 cookie —— 这些是 WAF / 设备指纹 / 统计用的，不是登录态。
+ *
+ * 为什么必须留：实测（E-001）面板内嵌窗口把分区清成「零 cookie 冷客户端」后，
+ * POST /api/biz/code/smsCode/TencentVerifyCaptcha 会被阿里云 WAF 挑战
+ * （返回 HTML 挑战页，界面显示「请进行验证，通过后即可注册/登录」，人拖滑块也没用）；
+ * 而同一个出口 IP 上的真 Chrome **始终带着** ssxmod_itna / TDC_itoken / _TDID_CK 这些令牌，
+ * 同样的请求全部拿到业务 JSON。清掉的正是这几样，等于每次授权都自报「可疑新客户端」。
+ */
+const KEEP_COOKIE_RE = /^(ssxmod_itna2?|TDC_itoken|_TDID_CK|Hm_lvt_|Hm_lpvt_|HMACCOUNT|sensorsdata|sajssdk|_clck|_clsk)/i;
+
+/** 明确要清掉的登录态 cookie（清这个是原设计的初衷：避免新号绑到上一个 BigModel 账号） */
+const AUTH_COOKIE_RE = /^(bigmodel_token|bigmodel-token|user$|Bigmodel-Organization|Bigmodel-Project|ProjectMembers|captcha_rid|lang$)/i;
+
+function cookieUrl(c) {
+  const host = String(c.domain || '').replace(/^\./, '');
+  const scheme = c.secure ? 'https' : 'http';
+  return scheme + '://' + host + (c.path || '/');
+}
+
 async function clearPanelOAuthSession(provider) {
   const partition = PANEL_OAUTH_PARTITION(provider);
   const via = [];
   let err = null;
   let before = 0;
+  let removedCookies = 0;
 
   try {
     const ses = session.fromPartition(partition);
     before = (await ses.cookies.get({})).length;
+    // 存储照旧全清（登录态就在 localStorage 里），但**不再清 cookies**
     await ses.clearStorageData({
       storages: [
-        'cookies',
         'localstorage',
         'indexdb',
         'websql',
@@ -993,27 +1049,31 @@ async function clearPanelOAuthSession(provider) {
       ],
     });
     via.push('session');
+    // cookies 改成定点清：只删登录态，保留 WAF/设备/统计令牌
+    for (const c of await ses.cookies.getAll({})) {
+      if (KEEP_COOKIE_RE.test(c.name)) continue;
+      if (!AUTH_COOKIE_RE.test(c.name)) continue;
+      try { await ses.cookies.remove(cookieUrl(c), c.name); removedCookies++; } catch (_) {}
+    }
+    if (removedCookies) via.push('cookies:' + removedCookies);
   } catch (e) {
     err = e.message || String(e);
   }
 
-  // 兜底：分区还没被加载过时目录可能仍在，直接删更彻底
-  try {
-    const dir = panelOAuthPartitionDir(provider);
-    if (fs.existsSync(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-      via.push('fs');
-    }
-  } catch (_) {
-    // 被锁说明分区活着，session API 那条路已经清过了，忽略
-  }
+  // 【不再删分区目录】以前这里是 rmSync(分区目录) 兜底，但那个目录里就有 Cookies 文件——
+  // 删掉等于把上面特意保留的 WAF 令牌一起抹了，冷客户端又回来了。session API 清不掉的
+  // 情况极少，宁可留一点残留，也不要每次授权都变成全新客户端。
+  if (!via.length && !err) via.push('noop');
 
   let after = 0;
+  let kept = 0;
   try {
-    after = (await session.fromPartition(partition).cookies.get({})).length;
+    const list = await session.fromPartition(partition).cookies.getAll({});
+    after = list.length;
+    kept = list.filter((c) => KEEP_COOKIE_RE.test(c.name)).length;
   } catch (_) {}
 
-  return { ok: !err, provider, cleared: via.length > 0, before, after, via, reason: err };
+  return { ok: !err, provider, cleared: via.length > 0, before, after, kept, removedCookies, via, reason: err };
 }
 
 // 授权会话里还剩什么。
@@ -1236,6 +1296,20 @@ function writeLiveBackToSnapshot() {
   return { ok: true, changed: false, skipped: 'datadir-architecture' };
 }
 
+/**
+ * Windows 上「文件被别的进程占着」的判定。
+ *
+ * 典型场景：ZCode 客户端开着某个账号时一直占着 session\Network\Cookies（SQLite），
+ * 于是**整个账号目录**改不了名、删不掉。EBUSY 是最常见的，EPERM/EACCES 在
+ * 杀毒软件或资源管理器预览插一脚时也会出现。
+ */
+const LOCK_ERR_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY']);
+function isLockError(e) {
+  if (!e) return false;
+  if (LOCK_ERR_CODES.has(e.code)) return true;
+  return /resource busy|locked|being used by another process|另一个程序正在使用/i.test(String(e.message || ''));
+}
+
 async function deleteAccount(id) {
   const dir = path.join(accountsDir(), id);
   if (!fs.existsSync(dir)) return { ok: false, msg: `账号 ${id} 不存在` };
@@ -1254,7 +1328,8 @@ async function deleteAccount(id) {
 
   // 移到回收站而不是直接删。凭据里带着 access_token，误删一个还有效的账号
   // 只能重新授权，代价远大于留一个目录。
-  const trashDir = path.join(accountsDir(), '.trash-' + localDate().replace(/-/g, ''));
+  const trashName = '.trash-' + localDate().replace(/-/g, '');
+  const trashDir = path.join(accountsDir(), trashName);
   fs.mkdirSync(trashDir, { recursive: true });
   let dst = path.join(trashDir, id);
   let n = 1;
@@ -1266,21 +1341,56 @@ async function deleteAccount(id) {
   // 删掉的正好是当前账号 → 清掉 .current，否则它指向一个不存在的目录，
   // 界面会显示"当前账号 XXX"却什么都读不到。
   const clearCurrent = () => { if (isCurrent) writeCurrentId(null); };
+  const done = (extra) => ({
+    ok: true,
+    msg: `已移到回收站：${trashName}/${path.basename(dst)}${extra || ''}`,
+    trash: dst,
+  });
 
-  try {
-    fs.renameSync(dir, dst);
-    clearCurrent();
-    return { ok: true, msg: `已移到回收站：.trash-${localDate().replace(/-/g, '')}/${path.basename(dst)}`, trash: dst };
-  } catch (e) {
-    // 跨卷 rename 会失败，退回复制再删
+  // ── ① 先改名。回收站就在同一个 accounts\ 下，同卷改名是瞬时的 ──
+  //
+  // 以前这里为什么会失败：Windows 下**目录里只要有任一文件被别的进程打开**，
+  // 整个目录改名就会 EBUSY。ZCode 客户端开着这个账号时一直占着
+  // session\Network\Cookies（SQLite），于是改名失败；而旧代码把 EBUSY 一律
+  // 当成"跨卷"，直接掉进复制兜底 —— 复制到同一个 Cookies 时照样 EBUSY，
+  // 最后报一条「移除失败：EBUSY ... copyfile Cookies」，账号还留在原地。
+  let killedClient = false;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await fsp.cp(dir, dst, { recursive: true });
-      await fsp.rm(dir, { recursive: true, force: true });
+      fs.renameSync(dir, dst);
       clearCurrent();
-      return { ok: true, msg: `已移到回收站：${path.basename(dst)}`, trash: dst };
-    } catch (e2) {
-      return { ok: false, msg: '移除失败：' + ((e2 && e2.message) || String(e2)) };
+      return done(killedClient ? '（文件被 ZCode 客户端占用，已先关闭客户端）' : '');
+    } catch (e) {
+      lastErr = e;
+      if (!isLockError(e)) break;                 // 不是占用问题，别浪费轮次
+      if (!killedClient) {                        // 第一次撞到占用：关掉客户端再试
+        await killZCode();
+        killedClient = true;
+      }
+      await wait(600 * (attempt + 1));            // 等 Windows 把句柄真正放掉
     }
+  }
+
+  // ── ② 兜底：复制再删。改名怎么都不成才走到这（真跨卷，或有进程赖着不放）──
+  //
+  // dereference:false 必须显式写：data\.zcode\cli、home\.zcode 这几个是**指回
+  // 使用者真实 ~/.zcode 的目录联接**，顺着拷会把他的对话记录和插件整份复制进回收站。
+  // （实测 Node 的 fs.cp 默认就不跟随，但默认值不是契约，写死更保险。）
+  try {
+    await fsp.cp(dir, dst, { recursive: true, force: true, dereference: false });
+    await fsp.rm(dir, { recursive: true, force: true });
+    clearCurrent();
+    return done(killedClient ? '（文件被 ZCode 客户端占用，已先关闭客户端）' : '');
+  } catch (e2) {
+    // 复制到一半失败会在回收站里留个半拉子目录：既不是能取回的备份，
+    // 又会一次次堆着（实测攒了 3 份 id 后缀递增的残缺副本）。清掉它。
+    try { await fsp.rm(dst, { recursive: true, force: true }); } catch (_) {}
+    const base = (e2 && e2.message) || String(e2);
+    const hint = (isLockError(e2) || isLockError(lastErr))
+      ? '\n\n文件被占用：请先关闭 ZCode 客户端，以及任何打开着这个账号目录的程序（资源管理器预览、杀毒扫描等），再试一次。'
+      : '';
+    return { ok: false, msg: '移除失败：' + base + hint };
   }
 }
 
@@ -1799,8 +1909,120 @@ function toProxyRules(resolved) {
   return addr;
 }
 
+/**
+ * 内嵌授权窗口的「浏览器指纹归一化」。
+ *
+ * 为什么必须做（实测证据）：天御滑块**已经过了**、ticket 都签发了
+ * （cap_union_new_verify → {"randstr":"@79H","ticket":"tr03192…"}），
+ * 但紧接着的 POST /api/biz/code/smsCode/TencentVerifyCaptcha 被**阿里云 WAF** 拦下：
+ * 返回 HTML 挑战页（<title>访问验证</title>，文案就是「请进行验证，通过后即可注册/登录」）。
+ * 前端拿到 HTML 而不是 JSON，于是界面上又显示要验证 —— 人怎么拖都没用。
+ *
+ * 对照实验（同一出口 IP、同一时刻）：
+ *   真 Chrome 153  → 两个端点都拿到业务 JSON（TencentVerifyCaptcha 返回「验证码Ticket不合法」，说明到了业务层）
+ *   面板 Electron  → VerifyCaptcha 通过、TencentVerifyCaptcha 被 WAF 挑战
+ * 即：触发 WAF 的是**客户端指纹**，不是 IP、也不是端点规则。
+ *
+ * 归一化三件事：
+ *   ① UA 去掉 Electron / 自定义产品名，版本号冒充本机真实装的 Chrome；
+ *   ② sec-ch-ua 用与所声明版本相符的写法（≤130 是 "Not?A_Brand";v="99"，≥131 是 "Not_A Brand";v="24"）；
+ *   ③ sec-ch-ua-mobile / sec-ch-ua-platform 补齐。
+ */
+
+/** 找本机装的 Chrome/Edge 版本号：扫 Application 目录下的版本号子目录，取最大的 major */
+function detectInstalledChromiumMajor() {
+  const majors = [];
+  const roots = [];
+  const pf = process.env['ProgramFiles'] || 'C:\\Program Files';
+  const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+  const local = process.env['LOCALAPPDATA'] || path.join(HOME, 'AppData', 'Local');
+  if (process.platform === 'win32') {
+    roots.push(path.join(pf, 'Google', 'Chrome', 'Application'));
+    roots.push(path.join(pf86, 'Google', 'Chrome', 'Application'));
+    roots.push(path.join(local, 'Google', 'Chrome', 'Application'));
+    roots.push(path.join(pf, 'Microsoft', 'Edge', 'Application'));
+    roots.push(path.join(pf86, 'Microsoft', 'Edge', 'Application'));
+  }
+  for (const root of roots) {
+    try {
+      for (const name of fs.readdirSync(root)) {
+        const m = /^(\d+)\.\d+\.\d+\.\d+$/.exec(name);
+        if (m) majors.push(Number(m[1]));
+      }
+    } catch (_) {}
+  }
+  const own = Number(String(process.versions.chrome || '0').split('.')[0]) || 0;
+  const best = Math.max(own, ...(majors.length ? majors : [0]));
+  return best > 0 ? best : 130;
+}
+
+const DISGUISE_CHROME_MAJOR = detectInstalledChromiumMajor();
+const DISGUISE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/'
+  + DISGUISE_CHROME_MAJOR + '.0.0.0 Safari/537.36';
+const DISGUISE_CH_UA = DISGUISE_CHROME_MAJOR >= 131
+  ? '"Google Chrome";v="' + DISGUISE_CHROME_MAJOR + '", "Not_A Brand";v="8", "Chromium";v="' + DISGUISE_CHROME_MAJOR + '"'
+  : '"Google Chrome";v="' + DISGUISE_CHROME_MAJOR + '", "Chromium";v="' + DISGUISE_CHROME_MAJOR + '", "Not?A_Brand";v="99"';
+const DISGUISE_HOSTS = ['*://bigmodel.cn/*', '*://*.bigmodel.cn/*', '*://*.zhipuai.cn/*', '*://chat.z.ai/*', '*://*.z.ai/*'];
+const disguiseApplied = new WeakSet();
+
+function applyBrowserDisguise(ses) {
+  if (!ses || disguiseApplied.has(ses)) return;
+  disguiseApplied.add(ses);
+  try { ses.setUserAgent(DISGUISE_UA); } catch (_) {}
+  try {
+    ses.webRequest.onBeforeSendHeaders({ urls: DISGUISE_HOSTS }, (details, cb) => {
+      try {
+        const h = details.requestHeaders || {};
+        // 只改带 Electron/自定义标记的 UA，别人的 UA 不动
+        if (/electron|zcode-panel/i.test(h['User-Agent'] || '')) h['User-Agent'] = DISGUISE_UA;
+        if (h['sec-ch-ua'] !== undefined || /bigmodel|zhipuai|z\.ai/i.test(details.url || '')) {
+          h['sec-ch-ua'] = DISGUISE_CH_UA;
+          h['sec-ch-ua-mobile'] = '?0';
+          h['sec-ch-ua-platform'] = '"Windows"';
+        }
+      } catch (_) {}
+      cb({ requestHeaders: details.requestHeaders });
+    });
+  } catch (e) {
+    try { pushDriverEvent({ level: 'warn', msg: '浏览器指纹伪装未能挂上：' + (e.message || e) }); } catch (_) {}
+  }
+}
+
+/**
+ * WAF 预热：在内嵌授权窗口打开登录页之前，先用一个隐藏窗口访问站点首页，
+ * 把 ssxmod_itna（阿里云 WAF 令牌）/ TDC_itoken（天御设备 cookie）等落进同一个分区。
+ *
+ * 依据（实测 E-001）：真 Chrome 之所以打短信接口从不被挑战，是因为它始终带着这些令牌；
+ * 面板清完分区后是零 cookie 冷客户端，那条最严的端点（TencentVerifyCaptcha）就会被 WAF 挑战。
+ * 已有令牌则直接跳过，不做多余请求。
+ */
+async function warmUpWafCookies(providerId) {
+  const partition = PANEL_OAUTH_PARTITION(providerId);
+  try {
+    const ses = session.fromPartition(partition);
+    const hasToken = async () => (await ses.cookies.getAll({})).some((c) => KEEP_COOKIE_RE.test(c.name));
+    if (await hasToken()) return { ok: true, skipped: true };
+    const probe = new BrowserWindow({ show: false, webPreferences: { partition } });
+    try { await probe.loadURL('https://bigmodel.cn/'); } catch (_) {}
+    for (let i = 0; i < 20; i++) {
+      if (await hasToken()) break;
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    const ok = await hasToken();
+    pushDriverEvent({
+      level: ok ? 'info' : 'warn',
+      msg: ok ? '已预热 WAF 令牌（短信接口不会再被挑战）' : 'WAF 预热没拿到令牌，继续走（短信接口可能仍被挑战）',
+    });
+    try { probe.destroy(); } catch (_) {}
+    return { ok };
+  } catch (e) {
+    return { ok: false, reason: e.message || String(e) };
+  }
+}
+
 async function applyOAuthProxyPolicy(providerId) {
   const ses = session.fromPartition(PANEL_OAUTH_PARTITION(providerId));
+  applyBrowserDisguise(ses);   // UA / sec-ch-ua 归一化，必须在 loadURL 之前
   try {
     const probe = await ses.resolveProxy('https://chat.z.ai/');
     const rules = toProxyRules(probe);
@@ -1854,21 +2076,9 @@ function extractCallbackCode(url) {
 // 两条线都是混合模式：手机号 / 邮箱、获取验证码、人机验证、填验证码由使用者在窗口里
 // 自己完成，驱动只负责自动点提交按钮和最后的授权确认。
 async function startOAuthFlow(providerId = 'bigmodel', mode = 'bridge', options = {}) {
-  // Z.ai 邮箱注册通道已被官方关闭：chat.z.ai 上不再提供邮箱注册入口，这条线走不通了。
-  //
-  // 界面上按钮已经标注「已失效」，这里再挡一道闸门，是为了让旧入口、脚本调用或
-  // 以后误接线的情况也拿不到一个能拖起来的流程——否则使用者会白填一遍表单、
-  // 白过一次人机验证、白搭一个邮箱，最后卡在「没有邮箱注册入口」那一步。
-  //
-  // 驱动代码（ZaiMailDriver）原样保留：通道若恢复，删掉这段判断即可复活。
-  if (providerId === 'zai') {
-    return {
-      ok: false,
-      deprecated: true,
-      msg: 'Z.ai 邮箱注册通道已被官方关闭，无法再注册新账号。'
-         + '请改用「BigModel 网页登录」，或用「浏览器授权导入」把已有 Z.ai 账号的登录态导进来。',
-    };
-  }
+  // Z.ai 邮箱注册**仍然有效**，只是必须真的从境外出口出去：
+  // 走国内出口时 chat.z.ai 不给邮箱注册入口，驱动会停在「切到注册表单」那一步。
+  // 出口地区在实际拉起窗口前由面板探测（见 oauth:probe-region），不在这里拦。
 
   // 授权窗口的 partition 是全局共用的，上一次授权登录的 bigmodel.cn 会留在里面。
   // 不先清掉，这次点「进行授权」就会把当前 Z.ai 账号绑到上一个 BigModel 账号上——
@@ -1891,6 +2101,10 @@ async function startOAuthFlow(providerId = 'bigmodel', mode = 'bridge', options 
   } else if (!proxyPolicy.ok) {
     pushDriverEvent({ level: 'warn', msg: '授权窗口代理设置失败：' + proxyPolicy.msg });
   }
+
+  // WAF 预热：第一次授权（或清理后）分区里没有 WAF 令牌，先访问一次站点首页把它落下来。
+  // 冷客户端打短信接口会被 WAF 挑战（实测 E-001），预热后与真 Chrome 一致。
+  await warmUpWafCookies(providerId);
 
   return new Promise((resolve, reject) => {
     // 连点「开始注册」会叠出多个授权窗口。旧窗口的 state 已经不可能被接住了，
@@ -2015,7 +2229,7 @@ async function startOAuthFlow(providerId = 'bigmodel', mode = 'bridge', options 
         return;
       }
 
-      pushDriverEvent({ level: 'info', msg: '开始 BigModel 网页登录：手机号 / 获取验证码 / 人机验证 / 填验证码由你在窗口里完成，填好后自动点「登录 / 注册」' });
+      pushDriverEvent({ level: 'info', msg: '开始 BigModel 网页登录：面板先收手机号并自动点「获取验证码」，你在弹窗里过人机验证、填短信验证码，填好后自动点「登录 / 注册」' });
       loginDriver = new LoginDriver({
         win: oauthWin,
         ask: askPanel,
@@ -2025,6 +2239,13 @@ async function startOAuthFlow(providerId = 'bigmodel', mode = 'bridge', options 
         .run()
         .then((r) => {
           if (pendingOAuth && r && r.phone) pendingOAuth.phone = r.phone;
+          const cap = r && r.captcha;
+          if (cap && (cap.ticket || cap.rid)) {
+            const which = cap.path === 'tencent' ? '腾讯天御' : (cap.path === 'shumei' ? '数美 Shumei' : '未识别链路');
+            pushDriverEvent({ level: 'info', msg: `人机验证链路：${which}（服务端一次性核销，不可复用）` });
+          } else if (r && r.ok) {
+            pushDriverEvent({ level: 'info', msg: '没抓到人机验证凭据（探针可能被页面导航清掉），登录本身已由人工完成' });
+          }
           pushDriverEvent({
             level: r.ok ? 'ok' : 'error',
             msg: r.ok
@@ -2049,6 +2270,108 @@ async function startOAuthFlow(providerId = 'bigmodel', mode = 'bridge', options 
     });
 
     oauthWin.loadURL(started.url);
+  });
+}
+
+/**
+ * A′ 方案：用**本机真实 Chrome** 完成授权，而不是面板内嵌窗口。
+ *
+ * 为什么（实测 E-001）：那条发短信接口在 Electron 里会被阿里云 WAF 挑战
+ * （返回 HTML 挑战页 → 界面显示「请进行验证…」，人拖滑块也没用），
+ * 同一台机器同一个出口 IP 的真 Chrome 同请求畅通（同一张真 ticket 直接「获取成功」）。
+ * 社区也没有 ITNA(ssxmod_itna) 的实现，通用答案是换通道。
+ *
+ * 与内嵌窗口流程的关系：共用 pendingOAuth / completeOAuth，只是"谁去浏览器里点"换了人；
+ * 换 token、取用户信息、写账号快照这些收尾逻辑一行没改。
+ *
+ * 多账号：每次一个新 Chrome profile（chrome-auth 默认临时目录、用完删）→
+ * 新号不可能绑到上一个 BigModel 账号（内嵌窗口那个坑的根治办法）；bigmodel 强制直连。
+ */
+function startRealChromeOAuth(providerId = 'bigmodel', mode = 'bridge', options = {}) {
+  if (providerId !== 'bigmodel') {
+    return Promise.resolve({ ok: false, msg: '「真 Chrome 授权」目前只支持 BigModel（Z.ai 邮箱注册通道已被官方关闭）' });
+  }
+  if (pendingOAuth && !pendingOAuth.done) {
+    return Promise.resolve({ ok: false, msg: '已有一次授权在进行中，请先完成或关掉它' });
+  }
+  const state = crypto.randomBytes(16).toString('hex');
+  const started = oauth.buildAuthorizeUrl(providerId, state, mode);
+  return new Promise((resolve, reject) => {
+    pendingOAuth = {
+      provider: providerId,
+      mode,
+      state,
+      redirectUri: started.redirectUri,
+      authorizeUrl: started.url,
+      resolve,
+      reject,
+      done: false,
+      accountName: options.accountName || null,
+      bind: !!options.bind,
+      phone: null,
+      email: null,
+      via: 'real-chrome',
+    };
+    const relay = (e) => pushDriverEvent({
+      level: e.level === 'warn' ? 'warn' : (e.level === 'ok' ? 'ok' : 'info'),
+      msg: '[真 Chrome] ' + e.msg,
+    });
+    pushDriverEvent({
+      level: 'info',
+      msg: '开始「真 Chrome 授权」：面板会拉起本机 Chrome，你在里面填手机号 / 过人机验证 / 填短信验证码；完成后自动收回授权，不用复制粘贴',
+    });
+    (async () => {
+      try {
+        // 手机号：面板先问一次（校验 11 位），拿不到就靠人在窗口里自己填
+        let phone = options.phone ? String(options.phone).replace(/\D/g, '') : '';
+        if (!phone && typeof askPanel === 'function') {
+          for (let i = 0; i < 3 && !phone; i++) {
+            const v = await askPanel({
+              kind: 'phone',
+              label: i === 0 ? '请输入登录手机号（11 位）' : '手机号格式不对，请重新输入 11 位',
+              placeholder: '13800000000',
+              hint: '面板会自动填入 Chrome 并点「获取验证码」；弹窗里的人机验证仍需要你手动过一次',
+            });
+            if (v === null || v === undefined) break;
+            const d = String(v).replace(/\D/g, '');
+            if (/^1\d{10}$/.test(d)) phone = d;
+            else pushDriverEvent({ level: 'warn', msg: '手机号格式不对（需要 11 位、以 1 开头）' });
+          }
+        }
+        const r = await chromeAuth.runRealChromeOAuth({
+          authorizeUrl: started.url,
+          state,
+          phone,
+          direct: true,                 // bigmodel 国内站点：走代理会被掐断
+          timeoutMs: 15 * 60 * 1000,
+          autoClickGetCode: true,
+          // 短信下发后由面板弹框收验证码 → 自动回填 → 自动点「登录 / 注册」
+          askSmsCode: async () => {
+            const v = await askPanel({
+              kind: 'code',
+              label: '请输入收到的短信验证码',
+              placeholder: '6 位数字',
+              hint: '人机验证通过后短信才会下发；填好后面板会自动点「登录 / 注册」',
+            });
+            return v ? String(v).replace(/\D/g, '') : '';
+          },
+          onEvent: relay,
+        });
+        pushDriverEvent({ level: 'ok', msg: '已取回授权回调，正在换取令牌…' });
+        completeOAuth(r.code, r.state || state);
+      } catch (e) {
+        const msg = (e && e.message) || String(e);
+        pushDriverEvent({ level: 'error', msg: '真 Chrome 授权未完成：' + msg });
+        if (pendingOAuth && !pendingOAuth.done) {
+          pendingOAuth.done = true;
+          const err = new Error(msg);
+          err.code = 'real_chrome_failed';
+          const p = pendingOAuth;
+          pendingOAuth = null;
+          p.reject(err);
+        }
+      }
+    })();
   });
 }
 
@@ -2088,6 +2411,13 @@ function completeOAuth(code, state) {
         email: pending.email || null,
         via: pending.via || 'oauth',
       });
+
+      // 立刻把这个账号的设备码落进它的 telemetry-state.json。
+      // 原先只有 launchZCode 时才写（syncDeviceMidToZCode 在启动路径里），
+      // 于是刚授权的账号在「首次启动客户端」之前没有 deviceMid ——
+      // 而余额/套餐接口是**必需** X-Device-Mid 的，缺了直接 400 code=3001 parameter error
+      // （account-query.js 头部注释写明的坑，本工具 import-batch.js 也踩过一次）。
+      try { syncDeviceMidToZCode(accountDeviceId(saved.id), saved.id); } catch (_) {}
 
       let business = 'skipped';
       if (pending.provider === 'zai') {
@@ -2206,6 +2536,41 @@ ipcMain.handle('accounts:import', async (_e, payload, opts) => {
     return r;
   } catch (e) {
     return { ok: false, error: 'exception', msg: (e && e.message) || String(e) };
+  }
+});
+
+// 导出账号：产出与「导入账号」完全同构的 JSON —— 复制走，或另存成 .json，
+// 换一个面板/小店直接粘回导入框就能复原。格式与自检都由 export-account.js 统一负责。
+ipcMain.handle('accounts:export', (_e, id) => {
+  try {
+    return accountExporter.exportAccount({ id, accountsDir: accountsDir() });
+  } catch (e) {
+    return { ok: false, error: 'exception', msg: (e && e.message) || String(e) };
+  }
+});
+
+// 另存为 .json。导入那边也收 .json 文件，这边就对称地给一个。
+ipcMain.handle('accounts:export-save', async (_e, id) => {
+  let r;
+  try {
+    r = accountExporter.exportAccount({ id, accountsDir: accountsDir() });
+  } catch (e) {
+    return { ok: false, error: 'exception', msg: (e && e.message) || String(e) };
+  }
+  if (!r.ok) return r;
+  const opts = {
+    title: '导出账号',
+    defaultPath: r.id + '.json',
+    filters: [{ name: 'JSON', extensions: ['json'] }],
+  };
+  try {
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0] || null;
+    const res = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts);
+    if (res.canceled || !res.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(res.filePath, r.text, 'utf8');
+    return { ok: true, path: res.filePath };
+  } catch (e) {
+    return { ok: false, msg: '写文件失败：' + ((e && e.message) || e) };
   }
 });
 
@@ -2540,6 +2905,7 @@ ipcMain.handle('panel:ask-abort', (_e, id) => {
 });
 ipcMain.handle('oauth:link', (_e, provider, mode) => buildManualAuthorizeLink(provider || 'bigmodel', mode || 'direct'));
 ipcMain.handle('oauth:submit', (_e, input) => submitManualCode(input));
+ipcMain.handle('oauth:chrome', (_e, provider, mode, options) => startRealChromeOAuth(provider || 'bigmodel', mode || 'bridge', options || {}));
 ipcMain.handle('balance:fetch', (_e, force) => balance.fetchBalance(force));
 
 // 面板里点外链（一键三连 / 开源地址）时走这里，交给系统默认浏览器打开。
@@ -2755,6 +3121,12 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     protocol.handle('zcode', handleOAuthCallback);
     createWindow();
+    if (PANEL_DEBUG_PORT) {
+      // 打眼一行，别让人忘了自己开过调试端口
+      console.log('[panel] 调试端口已开启：http://127.0.0.1:' + PANEL_DEBUG_PORT
+        + '　挂监控：node monitor-register.js --attach ' + PANEL_DEBUG_PORT
+        + '　（本机无鉴权，用完请去掉 ZCODE_PANEL_DEBUG_PORT / --debug-port）');
+    }
     // 预热客户端进程启动时间，避免首次写快照时判据拿不到值
     refreshZcodeStart().catch(() => {});
   });

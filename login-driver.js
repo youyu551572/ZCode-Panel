@@ -26,6 +26,51 @@
 const STEP_INTERVAL_MS = 600;
 const ELEMENT_WAIT_MS = 30000;
 
+// 人机验证探针：与 capture-captcha-rid.js 共用同一份页面内钩子源码，改一处两边都生效
+const CAPTCHA_HOOK_SRC = require('./captcha-hook').CAPTCHA_HOOK_SRC;
+
+/** 日志脱敏：凭据只留前几位，长度另记（rid/ticket 会进日志，不该明文落盘） */
+function maskValue(v, head = 8) {
+  const s = String(v == null ? '' : v);
+  if (!s) return '(空)';
+  return s.length <= head ? s : s.slice(0, head) + '…(len=' + s.length + ')';
+}
+
+/** 手机号脱敏：138****0000 */
+function maskPhone(v) {
+  const d = String(v || '').replace(/\D/g, '');
+  return d.length === 11 ? d.slice(0, 3) + '****' + d.slice(7) : d;
+}
+
+/**
+ * 请求体脱敏：票据类字段（ticket/randstr/rid/token/jwt/secret/key）一律只留极少几位。
+ * 直接把整个 body 截断是不够的——票据很短，截断反而把明文留在日志里。
+ */
+function maskSecret(v) {
+  const s = String(v == null ? '' : v);
+  if (!s) return '(空)';
+  return s.slice(0, s.length > 12 ? 8 : 2) + '…(len=' + s.length + ')';
+}
+
+function maskBody(body) {
+  const s = String(body == null ? '' : body);
+  if (!s) return '(空)';
+  try {
+    const j = JSON.parse(s);
+    if (j && typeof j === 'object' && !Array.isArray(j)) {
+      const out = {};
+      for (const k of Object.keys(j)) {
+        const v = j[k];
+        if (/ticket|randstr|rid|token|jwt|secret|key/i.test(k)) out[k] = maskSecret(v);
+        else if (typeof v === 'string' && v.length > 60) out[k] = maskValue(v, 24);
+        else out[k] = v;
+      }
+      return JSON.stringify(out);
+    }
+  } catch (_) { /* 不是 JSON 就走整体脱敏 */ }
+  return maskValue(s, 60);
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -271,18 +316,141 @@ const PAGE_CLICK_TEXT = function (texts, opts) {
  * 必须两个输入框都有有效值才点。
  */
 class LoginDriver extends BaseDriver {
-  constructor({ win, log, ask, timeoutMs = 20 * 60 * 1000, clickGapMs = 4500 }) {
+  constructor({ win, log, ask, timeoutMs = 20 * 60 * 1000, clickGapMs = 4500, autoSendCode = true }) {
     super({ win, log, ask });
     this.timeoutMs = timeoutMs;
     this.clickGapMs = clickGapMs;
+    this.autoSendCode = autoSendCode;
     this.lastClickAt = 0;
     this.lastCode = null;
     this.phone = null;
+    this.captcha = null;        // 人机验证凭据快照（rid / ticket / randstr / 请求体）
+    this.captchaLogged = false;
+    this.probeReady = false;
   }
 
   /** 登录/注册提交按钮。文案带斜杠和空格两种写法都试 */
   clickLogin() {
     return this.eval(PAGE_CLICK_TEXT, ['登录 / 注册', '登录/注册', '登录 / 注 册'], { exact: true });
+  }
+
+  /**
+   * 注入人机验证探针（幂等）。
+   *
+   * 必须在点「获取验证码」之前注入：探针要在页面主世界包住 TencentCaptcha / initSMCaptcha，
+   * 弹窗回调产生的那一刻才能拿到 ticket/randstr/rid。
+   * 用间接 eval 是为了跑在页面全局作用域（this.eval 是 (function(){...})() 包裹的）。
+   */
+  async installCaptchaProbe() {
+    const r = await this.eval((src) => {
+      try {
+        (0, eval)(src);
+        return window.__helmdCaptchaHook ? 'ok' : 'no-flag';
+      } catch (e) {
+        return 'err:' + ((e && e.message) || e);
+      }
+    }, CAPTCHA_HOOK_SRC);
+    this.probeReady = r === 'ok' || r === true;
+    return this.probeReady ? true : String(r);
+  }
+
+  /** 读探针结果快照（null = 页面里还没注入或已导航丢掉） */
+  probeCaptchaCreds() {
+    return this.eval(() => {
+      const r = window.__helmdCaptcha || null;
+      if (!r) return null;
+      const req = (r.requests || []).slice(-1)[0] || null;
+      return {
+        path: r.smcpRid ? 'shumei' : (r.ticket ? 'tencent' : (r.rid ? 'rid-only' : null)),
+        rid: (r.rid && r.rid.value) || null,
+        ridStore: (r.rid && r.rid.store) || null,
+        ridKey: (r.rid && r.rid.key) || null,
+        ticket: r.ticket || null,
+        randstr: r.randstr || null,
+        pass: r.pass === undefined ? null : r.pass,
+        deviceToken: r.deviceToken || null,
+        requestUrl: req ? req.url : null,
+        requestBody: req ? req.body : null,
+        hooks: (r.hits || []).map((h) => h.what),
+      };
+    });
+  }
+
+  /**
+   * 把探针结果写成一行人类可读的日志。
+   * 这是「人机验证到底过没过、走的是哪条链路」的唯一可靠信号：
+   * ticket/randstr 只在腾讯弹窗 ret===0 时存在，rid 只在数美 onSuccess(pass=true) 时存在。
+   */
+  reportCaptchaCreds(c) {
+    if (!c) return false;
+    const hit = !!(c.rid || c.ticket);
+    if (!hit) return false;
+    this.captchaLogged = true;
+    this.captcha = c;
+    const which = c.path === 'tencent' ? '腾讯天御' : (c.path === 'shumei' ? '数美 Shumei' : '未识别链路');
+    const bits = [];
+    if (c.ticket) bits.push('ticket=' + maskValue(c.ticket, 10));
+    if (c.randstr) bits.push('randstr=' + maskValue(c.randstr, 6));
+    if (c.rid) bits.push('rid=' + maskValue(c.rid, 10) + '（存于 ' + (c.ridStore || '?') + '/' + (c.ridKey || '?') + '）');
+    if (c.deviceToken) bits.push('deviceToken=' + maskValue(c.deviceToken, 10));
+    this.ok(`人机验证通过（${which}）：` + bits.join(' '));
+    if (c.requestUrl) this.log(`验证码请求已发出：POST ${c.requestUrl} body=${maskBody(c.requestBody)}`);
+    else this.log('已拿到凭据，但还没看到验证码请求（可能刚点完「获取验证码」）');
+    return true;
+  }
+
+  /** 把手机号灌进页面（受控输入必须走 native setter + input 事件） */
+  fillPhone(phone) {
+    return this.eval((p) => {
+      const vis = (e) => e && e.offsetParent !== null;
+      const inputs = Array.from(document.querySelectorAll('input')).filter(vis);
+      const el = inputs.find((e) => /手机|电话|phone|mobile/i.test((e.placeholder || '') + (e.name || '')) || e.type === 'tel');
+      if (!el) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(el, String(p));
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+      return true;
+    }, phone);
+  }
+
+  /**
+   * 点「获取验证码」。
+   * 返回 true=已点；'counting'=按钮在 60 秒倒计时里（别重复点）；'no-button'=没找到。
+   */
+  getIdCode() {
+    return this.eval(() => {
+      const vis = (e) => e && e.offsetParent !== null;
+      const btn = Array.from(document.querySelectorAll('button, a, div, span'))
+        .filter(vis)
+        .find((e) => /^获取验证码s?$/.test((e.innerText || '').trim()));
+      if (!btn) return 'no-button';
+      if (/^\d+s$/.test((btn.innerText || '').trim())) return 'counting';
+      btn.click();
+      return true;
+    });
+  }
+
+  /**
+   * 向使用者要手机号。
+   * 注意：面板的 askPanel 只透传 kind/label/placeholder/hint，**不认 validate 回调**，
+   * 所以校验只能在这里做——不合规就再问一次（最多 3 次），取消则返回 null 回退到全手动模式。
+   */
+  async askPhone() {
+    for (let i = 0; i < 3; i++) {
+      const v = await this.askText({
+        kind: 'phone',
+        label: i === 0 ? '请输入登录手机号（11 位）' : '手机号格式不对，请重新输入 11 位手机号',
+        placeholder: '13800000000',
+        hint: '填好后会自动填入登录页并点「获取验证码」；弹窗里的人机验证仍需你完成',
+      });
+      if (v === null) return null;
+      const digits = String(v).replace(/\D/g, '');
+      if (/^1\d{10}$/.test(digits)) return digits;
+      this.warn('手机号格式不对：' + maskPhone(digits) + '（需要 11 位、以 1 开头）');
+    }
+    return null;
   }
 
   checkAgreement() {
@@ -343,7 +511,41 @@ class LoginDriver extends BaseDriver {
       if (!ready) { this.fail('登录页未出现手机号输入框'); return { ok: false, msg: this.lastError }; }
       this.ok('登录页已就绪');
 
-      this.manual('请填写手机号 → 点「获取验证码」→ 过拼图验证 → 填写收到的验证码；填好后会自动点「登录 / 注册」');
+      // ---- 1. 先注入人机验证探针（必须在打开弹窗之前）
+      const probe = await this.installCaptchaProbe();
+      if (probe === true) this.log('人机验证探针已注入（抓 ticket/randstr、Shumei rid、captcha_rid 落盘位置、验证码请求体）');
+      else this.warn('人机验证探针注入失败：' + probe + '（不影响登录，只是看不到验证走的是哪条链路与凭据）');
+
+      // ---- 2. 手机号 + 自动点「获取验证码」；拿不到手机号就退回全手动
+      let auto = false;
+      if (this.autoSendCode && this.ask) {
+        const phone = await this.askPhone();
+        if (phone) {
+          this.phone = phone;
+          this.setPhase('fill-phone');
+          if (await this.fillPhone(phone)) {
+            this.ok('已填入手机号 ' + maskPhone(phone));
+            await sleep(400);
+            if (await this.checkAgreement()) this.log('已勾选协议');
+            this.setPhase('send-code');
+            const clicked = await this.getIdCode();
+            if (clicked === true) {
+              auto = true;
+              this.manual('已点「获取验证码」——请在弹出的验证窗口里完成人机验证（滑块 / 依次点击）；通过后填写收到的短信验证码');
+            } else if (clicked === 'counting') {
+              auto = true;
+              this.manual('「获取验证码」正在倒计时，直接完成人机验证并填写短信验证码');
+            } else {
+              this.manual('没找到「获取验证码」按钮，请在窗口里手动点一下并完成人机验证');
+            }
+          } else {
+            this.manual('没找到手机号输入框，请在窗口里手动填写手机号 → 点「获取验证码」→ 过人机验证');
+          }
+        }
+      }
+      if (!auto) {
+        this.manual('请填写手机号 → 点「获取验证码」→ 过拼图验证 → 填写收到的验证码；填好后会自动点「登录 / 注册」');
+      }
 
       this.setPhase('waiting-user');
       const deadline = Date.now() + this.timeoutMs;
@@ -352,6 +554,10 @@ class LoginDriver extends BaseDriver {
 
       while (Date.now() < deadline && this.alive && !authorized) {
         if (await this.onAuthorizePage()) { authorized = true; break; }
+        // 人机验证结论（只报一次）：这一行是「验证到底过没过、走哪条链路」的唯一可靠信号
+        if (this.probeReady && !this.captchaLogged) {
+          this.reportCaptchaCreds(await this.probeCaptchaCreds());
+        }
         const s = await this.probeForm();
         if (s && s.hasForm && s.phoneOk && s.codeOk) {
           this.phone = s.phone;
@@ -363,7 +569,7 @@ class LoginDriver extends BaseDriver {
             this.lastCode = s.code;
             if (await this.clickLogin()) {
               submits += 1;
-              this.ok(`已自动点「登录 / 注册」（手机号 ${s.phone}，验证码 ${s.code}）`);
+              this.ok(`已自动点「登录 / 注册」（手机号 ${maskPhone(s.phone)}，验证码 ${maskValue(s.code, 2)}）`);
             }
           }
         }
@@ -383,10 +589,10 @@ class LoginDriver extends BaseDriver {
       else if (auth === 'click-failed') this.manual('「继续」按钮点击失败，请手动点一下');
 
       this.setPhase('done');
-      return { ok: true, phone: this.phone, submits, authorize: auth };
+      return { ok: true, phone: this.phone, submits, authorize: auth, captcha: this.captcha };
     } catch (e) {
       this.fail('自动化异常：' + (e.message || e));
-      return { ok: false, msg: this.lastError, phone: this.phone };
+      return { ok: false, msg: this.lastError, phone: this.phone, captcha: this.captcha };
     }
   }
 }

@@ -36,6 +36,10 @@
       "update.js",
       "session-index.js",
       "import-account.js",
+      "export-account.js",
+      "chrome-auth.js",
+      "captcha-hook.js",
+      "cdp-mini.js",
       "icon.ico",
       "renderer/**/*"
     ],

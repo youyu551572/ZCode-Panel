@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('zpanel', {
   proxySet: (url) => ipcRenderer.invoke('proxy:set', url),
   oauthLink: (provider, mode) => ipcRenderer.invoke('oauth:link', provider, mode),
   oauthSubmit: (input) => ipcRenderer.invoke('oauth:submit', input),
+  oauthChrome: (provider, mode, options) => ipcRenderer.invoke('oauth:chrome', provider, mode, options),
   // 自动化进度事件流
   onPanelEvent: (cb) => {
     const h = (_e, payload) => cb(payload);
@@ -64,6 +65,9 @@ contextBridge.exposeInMainWorld('zpanel', {
   openShop: (url) => ipcRenderer.invoke('shop:open', url),
   // 【导入账号】把从小店拿到的凭据导进本面板（B 方案：小店给凭据，面板来导入）
   importAccount: (payload, opts) => ipcRenderer.invoke('accounts:import', payload, opts),
+  // 【导出账号】产出与导入完全同构的 JSON，可直接粘回导入框复原
+  exportAccount: (id) => ipcRenderer.invoke('accounts:export', id),
+  exportAccountSave: (id) => ipcRenderer.invoke('accounts:export-save', id),
   quitApp: () => ipcRenderer.invoke('app:quit'),
   // 强制更新：检查 GitHub Releases，有新版就要求先更新
   updateCheck: () => ipcRenderer.invoke('update:check'),
