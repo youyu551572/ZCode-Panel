@@ -55,6 +55,31 @@ accounts/<账号名>/
 
 排障出口：设 `ZPANEL_SKIP_UPDATE=1` 启动可跳过检查（开发用，正式发布不要设）。
 
+### Z.ai 授权要用业务 token，不是 OAuth token
+
+Z.ai 授权分两步，第二步以前漏了：
+
+1. `/api/v1/oauth/token` 用 code 换回一个 **OAuth access_token**（短命，带 `exp`）
+2. 拿它 **POST 一次 `api.z.ai/api/auth/z/login`**（body `{"token": …}`），
+   把返回的 `data.access_token` 当作 `oauth:zai:access_token` 落盘
+
+第 2 步换来的才是**业务 token**（带 `user_key` / `customer_id`、**没有 `exp`**）。
+官方客户端对 `oauth:zai:access_token` 的契约就是这个业务 token，且明说「登录阶段完成转换，后续不再做兜底二次交换」。
+
+**漏掉第 2 步的症状**：授权当下看着正常，客户端重启后判 token 过期，
+把 `credentials.json` 清成 `{}`，界面变成「登录已过期，请重新登录」。
+
+判据看**载荷形状**，不看长度（长度是巧合）：
+
+| | 特征键 | 长度（实测参考） |
+| --- | --- | --- |
+| 业务 token | `user_key` / `customer_id`，**无 `exp`** | ≈1404 |
+| OAuth token | `iss: 'user-service'` / `scopes` | ≈404 |
+
+单独遇到**没有 `exp`** 的 token **不能**判它过期 —— 业务 token 本来就不带 `exp`。
+
+bigmodel 线不走这一步（它的 `/oauth/token` 直接给长期 token）。
+
 ### 发版流程（强制更新依赖它）
 
 更新检查比的是 `package.json` 的 `version` 和 Release 的 `tag_name`。所以每次发版必须：

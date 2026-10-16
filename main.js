@@ -2409,11 +2409,44 @@ function completeOAuth(code, state) {
   const pending = pendingOAuth;
   (async () => {
     try {
-      const tokenSet = await oauth.exchangeCode(pending.provider, code, state, pending.redirectUri);
+      const tokenSetRaw = await oauth.exchangeCode(pending.provider, code, state, pending.redirectUri);
+
+      // ★★ 落盘前必须把 OAuth token 归一化成「客户端契约要求的形态」★★
+      //
+      //   zai 线 /oauth/token 给的是**短命的 user-service OAuth token**，而客户端对
+      //   `oauth:zai:access_token` 的契约是 `/api/auth/z/login` 换来的**业务 token**
+      //   （带 user_key / customer_id、无 exp）。
+      //
+      //   以前这里漏了这一步，而且更糟：triggerBusinessLogin 明明调了接口，
+      //   却把返回的 token 扔了、只回一个 'ready'/'failed' 字符串 ——
+      //   等于「打了电话没听内容」。于是落盘的仍是 OAuth token，
+      //   客户端启动时判过期 → 把 credentials.json 清成 {} →
+      //   界面显示「登录已过期，请重新登录」。
+      //
+      //   必须在 importAsSnapshot / bindOAuthToCurrent **之前**做，两处落盘点
+      //   都读 tokenSet.accessToken，先换好就都对了。
+      //   bigmodel 线走这里会被短路成 swapMsg='not-zai'，零副作用。
+      const tokenSet = await oauth.normalizeTokenSet(tokenSetRaw);
+      if (tokenSet.swapped) {
+        console.log('[oauth] 已换成业务 token（zai 线，len=' + String(tokenSet.accessToken).length + '）');
+      } else if (pending.provider === 'zai' && tokenSet.swapMsg && tokenSet.swapMsg !== 'already-business') {
+        // 换失败不阻断授权（回退成原 token），但必须说出来 —— 这种号的症状是
+        // 「当前能用、过一会儿提示登录过期」，不说清楚事后根本查不到原因。
+        // 条件限定在 zai 线：bigmodel 走 not-zai 短路是**正常**的，别误报。
+        console.warn('[oauth] ★ 业务 token 没换到（' + tokenSet.swapMsg + '）'
+          + ' —— 落盘的仍是短命 OAuth token，客户端稍后会报「登录已过期」');
+      }
+
       let userInfo = null;
       try {
-        userInfo = await oauth.fetchUserInfo(pending.provider, tokenSet.accessToken);
+        // ★ 取用户信息必须用**原始 OAuth token**：业务 token 打 chat.z.ai 不认
+        //   （业务 token 是给客户端本地登录态用的，不是 api 凭据）。
+        userInfo = await oauth.fetchUserInfo(pending.provider, tokenSetRaw.accessToken);
       } catch (_) {}
+      // 兜底：万一原始那个取不到，再试试换过之后的
+      if (!userInfo && tokenSet.accessToken !== tokenSetRaw.accessToken) {
+        try { userInfo = await oauth.fetchUserInfo(pending.provider, tokenSet.accessToken); } catch (_) {}
+      }
 
       // 绑定模式：附加到当前账号身份上，不新建快照
       if (pending.bind) {
@@ -2448,14 +2481,22 @@ function completeOAuth(code, state) {
       // （account-query.js 头部注释写明的坑，本工具 import-batch.js 也踩过一次）。
       try { syncDeviceMidToZCode(accountDeviceId(saved.id), saved.id); } catch (_) {}
 
-      let business = 'skipped';
-      if (pending.provider === 'zai') {
-        business = await oauth.triggerBusinessLogin(tokenSet.accessToken).catch(() => 'failed');
-      }
+      // business 状态**从 tokenSet.swapped 推导**，不再单独打一次接口。
+      //
+      // 以前这里是 `await oauth.triggerBusinessLogin(tokenSet.accessToken)` ——
+      // 而上面 normalizeTokenSet 已经换过一次了。等于对**业务 token** 再换一次，
+      // 而业务 token 打 /z/login 会被拒（"user information is invalid"），
+      // 于是这个字段会**永久显示失败**，哪怕落盘的 token 明明是对的。
+      // 现在直接如实报告上面那一次的结果。
+      const business = tokenSet.swapped
+        ? 'ready'
+        : (pending.provider === 'zai' ? 'failed' : 'skipped');
       pending.resolve({
         ok: true,
         provider: pending.provider,
         business,
+        businessSwapped: !!tokenSet.swapped,
+        businessMsg: tokenSet.swapMsg || null,
         user: userInfo || { id: 'unknown', username: 'user', displayName: 'user' },
         account: saved,
         switched: false,

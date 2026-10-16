@@ -219,23 +219,139 @@ async function fetchUserInfo(providerId, accessToken) {
   }
 }
 
-// Z.ai 侧需要用 oauth access_token 再换一次业务 token
+/**
+ * Z.ai 侧需要用 oauth access_token 再换一次业务 token。
+ *
+ * ★ 这里**必须把换到的 token 带回去**，不能只回一个状态字符串。
+ *
+ *   以前本函数只 `return 'ready' / 'failed'`，调用方拿到状态就当没事了 ——
+ *   于是 `oauth:zai:access_token` 落盘的仍是那个**短命的 OAuth token**。
+ *   后果：客户端启动时判过期 → 把 credentials.json 清成 `{}` →
+ *   界面显示「登录已过期，请重新登录」。
+ *
+ *   官方开源源码把契约写死了（zaiProviderAdapter）：
+ *     · CLI flow 拿到的 **仍是 Z.ai OAuth token**
+ *     · `oauth:zai:access_token` 的契约是 **POST api.z.ai 的 auth/z/login 换来的业务 token**
+ *     · 「登录阶段完成转换…后续不再做兜底二次交换」
+ *   ⇒ 转换必须在这里做完，而且**必须用返回的那个 token**。
+ *
+ * @returns {Promise<{ok:boolean, token:string|null, code:any, msg:string|null, expiresIn:any}>}
+ */
 async function triggerBusinessLogin(accessToken) {
   const p = PROVIDERS.zai;
-  if (!p.businessLoginUrl) return 'skipped';
+  if (!p.businessLoginUrl) return { ok: false, token: null, code: null, msg: 'no-business-url' };
+  const tok = trimOrNull(accessToken);
+  if (!tok) return { ok: false, token: null, code: null, msg: 'empty-token' };
   try {
     const res = await fetch(p.businessLoginUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ token: accessToken }),
+      body: JSON.stringify({ token: tok }),
     });
     const json = await res.json().catch(() => null);
-    if (!json) return 'failed';
-    if (json.code === 0 || json.code === 200) return 'ready';
-    return 'failed';
-  } catch {
-    return 'failed';
+    if (!json) return { ok: false, token: null, code: null, msg: 'no-json' };
+    const codeOk = json.code === 0 || json.code === 200 || json.code === '0' || json.code === '200';
+    if (!codeOk || json.success === false) {
+      return { ok: false, token: null, code: json.code, msg: json.msg || 'rejected' };
+    }
+    const data = json.data || {};
+    const business = trimOrNull(data.access_token) || trimOrNull(data.accessToken);
+    if (!business) return { ok: false, token: null, code: json.code, msg: '缺 data.access_token' };
+    return { ok: true, token: business, code: json.code, msg: null, expiresIn: data.expires_in ?? null };
+  } catch (e) {
+    return { ok: false, token: null, code: null, msg: String((e && e.message) || e) };
   }
+}
+
+/** 读 JWT 载荷（不验签，只看形状）。解不动返回 null。 */
+function decodeJwtPayloadLoose(token) {
+  if (typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    return JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 判断一个 token 是「业务 token」还是「OAuth token」。
+ *
+ * **判据必须看载荷特征键，不能看长度。** 长度是巧合，载荷形状是契约：
+ *   · 业务 token：带 `user_key` / `customer_id`，**没有 `exp`**（实测 len≈1404）
+ *   · OAuth token：`iss === 'user-service'`、带 `scopes`（实测 len≈404）
+ *
+ * @returns {{ok:boolean, gen:'business'|'oauth'|'unknown', exp:number|null, secondsLeft:number|null, payload:object|null}}
+ */
+function classifyToken(token, nowSec = Math.floor(Date.now() / 1000)) {
+  const payload = decodeJwtPayloadLoose(token);
+  if (!payload || typeof payload !== 'object') {
+    return { ok: false, gen: 'unknown', exp: null, secondsLeft: null, payload: null };
+  }
+  const hasBiz = payload.user_key !== undefined || payload.customer_id !== undefined;
+  const hasOauth = payload.iss === 'user-service'
+    || payload.token_type === 'access_token'
+    || payload.scopes !== undefined;
+  const gen = hasBiz && !hasOauth ? 'business' : (hasOauth ? 'oauth' : 'unknown');
+  const exp = Number.isFinite(Number(payload.exp)) ? Number(payload.exp) : null;
+  return {
+    ok: true,
+    gen,
+    exp,
+    // 业务 token 没有 exp ⇒ secondsLeft 为 null（**不能**因此判它过期）
+    secondsLeft: exp === null ? null : exp - nowSec,
+    payload,
+  };
+}
+
+/**
+ * ★ 把 tokenSet 归一化成「客户端契约要求的形态」—— **落盘前必须过这一道**。
+ *
+ * 语义（别改成"失败就抛"）：换失败时**回退成原 token**，并如实标 `swapped:false` ——
+ * 一次业务接口抽风不该把整个号的授权结果丢掉。
+ *
+ * 短路条件（各有一条实测依据）：
+ *   · 已经是业务 token ⇒ 不重复兑换（业务 token 打 /z/login 会回 "user information is invalid"）
+ *   · bigmodel 线 ⇒ /oauth/token 直接给长期 token，本就不需要这一步
+ *   · 形状不像 OAuth ⇒ 不乱打接口
+ *
+ * 全程保留 `oauthAccessToken`：取用户信息必须用**原始 OAuth token**，
+ * 业务 token 打 chat.z.ai 不认（那是给客户端本地登录态用的，不是 api 凭据）。
+ *
+ * @param {object} tokenSet
+ * @param {object} [deps] 便于单测注入 { login }
+ */
+async function normalizeTokenSet(tokenSet, deps = {}) {
+  if (!tokenSet || typeof tokenSet !== 'object') return tokenSet;
+  const login = deps.login || triggerBusinessLogin;
+  const p = String(tokenSet.provider || '');
+  const tok = trimOrNull(tokenSet.accessToken);
+  if (!tok) return { ...tokenSet, swapped: false, swapMsg: 'no-token' };
+
+  const c = classifyToken(tok);
+  if (c.gen === 'business') {
+    return { ...tokenSet, oauthAccessToken: tok, swapped: false, swapMsg: 'already-business' };
+  }
+  if (p && p !== 'zai') {
+    return { ...tokenSet, oauthAccessToken: tok, swapped: false, swapMsg: 'not-zai' };
+  }
+  if (c.gen !== 'oauth') {
+    return { ...tokenSet, oauthAccessToken: tok, swapped: false, swapMsg: 'not-oauth-shaped' };
+  }
+
+  const r = await login(tok);
+  if (r && r.ok && r.token) {
+    return {
+      ...tokenSet,
+      accessToken: r.token,
+      oauthAccessToken: tok,
+      swapped: true,
+      swapMsg: null,
+      swapExpiresIn: r.expiresIn ?? null,
+    };
+  }
+  return { ...tokenSet, oauthAccessToken: tok, swapped: false, swapMsg: (r && r.msg) || 'failed' };
 }
 
 // ---------------------------------------------------------------- crypto
@@ -289,6 +405,10 @@ module.exports = {
   exchangeCode,
   fetchUserInfo,
   triggerBusinessLogin,
+  // 落盘前的 token 归一化：OAuth token → 业务 token
+  normalizeTokenSet,
+  classifyToken,
+  decodeJwtPayloadLoose,
   encrypt,
   decrypt,
   isEncrypted,
