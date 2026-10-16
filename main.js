@@ -6,7 +6,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const os = require('os');
 const crypto = require('crypto');
-const { execFile, exec, spawn } = require('child_process');
+const { execFile, exec, spawn, execFileSync } = require('child_process');
 const oauth = require('./oauth');
 const balance = require('./balance');
 const plan = require('./plan');
@@ -1102,6 +1102,104 @@ function killZCode() {
   });
 }
 
+/** 温和关（不带 /F 的 taskkill 就是发 WM_CLOSE），让客户端自己收尾 + WAL checkpoint */
+function closeZCodeGracefully() {
+  return new Promise((resolve) => {
+    execFile('taskkill', ['/IM', 'ZCode.exe'], (err) => resolve(!err || err.code === 128));
+  });
+}
+
+/**
+ * ZCode.exe 还在跑吗？（同步探测）
+ *
+ * 查不到就当作「没在跑」：探测本身失败不该让流程永久卡死
+ * （与参考实现同口径）。
+ */
+function zcodeRunningSync() {
+  if (process.env.ZPANEL_FORCE_ZCODE_IDLE === '1') return false;
+  if (process.env.ZPANEL_FORCE_ZCODE_RUNNING === '1') return true;
+  try {
+    const out = execFileSync('tasklist', ['/FI', 'IMAGENAME eq ZCode.exe', '/NH'],
+      { encoding: 'utf8', windowsHide: true, timeout: 15000 });
+    return /ZCode\.exe/i.test(out);
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 客户端是不是设了「关闭时最小化到托盘」？
+ *
+ * 设了的话发 WM_CLOSE（温和关）只会把窗口藏起来、**进程照旧活着**，
+ * 所以别浪费那几秒去"温和关"，直接说清楚然后强杀。
+ */
+function zcodeCloseToTray() {
+  try {
+    const s = safeJson(zcodeSettingFile()) || {};
+    return s.closeToTrayOnWindows === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * **切号/回滚/启动客户端的第一步：把 ZCode 彻底关掉，确认它真的不在了才返回。**
+ *
+ * 为什么不能只 `killZCode()` + 固定等 800ms（本面板原来的写法）：
+ *
+ *   · `taskkill` 是**异步**的，而客户端有 6~15 个进程（主 / renderer / zcode-host / 原生 host…）。
+ *     「看着关掉了」时很可能还剩一个 hold 着 `tasks-index.sqlite`。
+ *   · 只要还剩一个在跑，后面的「播种 / 回写共享库」就是在动**活库** ——
+ *     参考项目 2026-09-24 的 `corrupt(11)`（切一次号坏一次）就是这么来的。
+ *   · 固定 800ms 也不够：客户端退出时要 checkpoint WAL、写 setting.json。
+ *
+ * ★ 对本面板尤其致命的一点（实测确诊的「切号后会话历史很多不见了」）：
+ *   会话同步模块里有「客户端在跑就拒绝动库」的保护，会返回 'running' 并**什么都不做**。
+ *   而切号路径只 `killZCode()` + 等 800ms —— 客户端根本没退干净，于是那次回写
+ *   **静默跳过**，这个账号这一轮新聊的会话全留在私有库里；
+ *   下一轮切回它时又被共享库覆盖 → 永久丢失。
+ *   也就是说：**没有"确认进程归零"这一步，回写保护反而变成了丢会话的开关。**
+ *
+ * 顺序：托盘设置决定要不要先温和关 → 强杀 → 轮询确认"一个进程都不剩" → 再留收尾时间。
+ * 返回 `{ ok, ms, how }`；**`ok === false` 时调用方必须中止操作**，不要硬着头皮往下走。
+ */
+async function ensureZCodeStopped(label = '') {
+  const t0 = Date.now();
+  const gone = () => !zcodeRunningSync();
+  if (gone()) return { ok: true, ms: 0, how: 'already-stopped' };
+
+  let how = 'graceful';
+  if (zcodeCloseToTray()) {
+    // 设了"关闭最小化到托盘" → WM_CLOSE 只会藏窗口，别等了
+    how = 'forced';
+    console.log(`[panel] ${label}：客户端设了「关闭时最小化到托盘」，跳过温和关，直接强制结束`);
+  } else {
+    await closeZCodeGracefully();
+    for (let i = 0; i < 16; i++) {          // 最多约 4.8s 等它自己退
+      await wait(300);
+      if (gone()) break;
+    }
+  }
+  if (!gone()) {
+    how = 'forced';
+    await killZCode();
+    for (let i = 0; i < 40; i++) {          // 最多再约 12s
+      await wait(300);
+      if (gone()) break;
+    }
+  }
+
+  const ms = Date.now() - t0;
+  if (!gone()) {
+    console.warn(`[panel] ${label} 失败：无法让 ZCode 退出（${how} 之后仍有进程）`);
+    return { ok: false, ms, how };
+  }
+  // 进程没了不代表文件句柄立刻释放：再给 SQLite 一点收尾时间（checkpoint WAL）
+  await wait(1200);
+  console.log(`[panel] ${label} 客户端已彻底退出（${how}，${Date.now() - t0}ms）`);
+  return { ok: true, ms: Date.now() - t0, how };
+}
+
 /**
  * 每个账号独占的设备标识。
  *
@@ -1263,17 +1361,48 @@ async function switchAccount(id, opts = {}) {
 
   const prevId = readCurrentId();
 
-  await killZCode();
-  await wait(800);
+  // ★ 切号第一步：**先让 ZCode 彻底退出**（温和关 → 强杀 → 轮询确认一个进程都不剩）。
+  //
+  //   以前这里只 `killZCode()` + 固定等 800ms。客户端有 6~15 个进程，taskkill 还是异步的，
+  //   "看着关掉了"时往往还剩一个 hold 着 tasks-index.sqlite。后果有两层：
+  //     · 下面的会话回写会被「客户端在跑就拒绝动库」的保护挡掉 → **静默跳过** → 丢会话；
+  //     · 更早的版本里则是对着活库做拷贝，切一次号坏一次（corrupt(11)）。
+  //   ⇒ 必须确认进程归零才往下走，确认不了就中止。
+  const stop = await ensureZCodeStopped('切号 ' + (prevId || '-') + '→' + id);
+  if (!stop.ok) {
+    return {
+      ok: false,
+      msg: 'ZCode 没能完全退出（还有进程在跑），已中止切号 —— 请手动退出客户端（托盘也退）后重试',
+    };
+  }
 
   // ①-c 上一个账号这轮的会话索引并回共享库。
-  //      必须在**客户端已退出**之后、写入 .current 之前做（此时才是安全窗口）。
+  //      此刻客户端**已确认退出**，才是安全窗口。
   //      以前只靠 launchZCode 里的 syncIn 顺带回写，而它依赖模块级变量记"上次播种了谁"，
   //      面板一重启就归零 → 静默不回写 → 该账号新建的会话全留在私有库里。
-  //      现在标记落在磁盘上，这里显式回写一次，切号一定不丢会话记录。
   if (prevId && prevId !== id) {
-    try { sessionIndex.syncOutAccount(prevId, LEGACY_ZCODE_V2, accountsDir()); }
-    catch (e) { console.warn('[session-index] 回写失败：' + (e.message || e)); }
+    let outNote = 'no-account';
+    try { outNote = sessionIndex.syncOutAccount(prevId, LEGACY_ZCODE_V2, accountsDir()); }
+    catch (e) { outNote = 'THREW(' + ((e && e.message) || e) + ')'; }
+
+    // ★ 回写失败必须**中止切号**，不能记条日志就往下走。
+    //
+    //   一旦继续往下：.current 被改写、客户端在新数据根起来，而上一个账号的数据根
+    //   再也不会被播种它的那轮覆盖 —— 那些会话就此永久留在私有库里。
+    //   宁可让使用者重试一次切号，也不能让他丢记录。
+    //   'not-seeded' 是正常情况（这个账号还没被播种过，本来就没有该回写的东西）。
+    const fatal = /^(THREW|source-corrupt|running|failed)/.test(String(outNote));
+    if (fatal) {
+      console.warn('[session-index] 回写失败，已中止切号：' + outNote);
+      return {
+        ok: false,
+        msg: `切换已中止：账号 ${prevId} 的会话索引没能并回公共库（${outNote}）。`
+           + '为避免会话记录丢失，暂时不切。请关闭 ZCode 客户端后重试。',
+        prevId: prevId || null,
+        sessionWriteBack: outNote,
+      };
+    }
+    console.log('[session-index] 切号回写 ' + prevId + '：' + outNote);
   }
 
   writeCurrentId(id);
@@ -1364,21 +1493,32 @@ async function deleteAccount(id) {
   // session\Network\Cookies（SQLite），于是改名失败；而旧代码把 EBUSY 一律
   // 当成"跨卷"，直接掉进复制兜底 —— 复制到同一个 Cookies 时照样 EBUSY，
   // 最后报一条「移除失败：EBUSY ... copyfile Cookies」，账号还留在原地。
-  let killedClient = false;
-  let lastErr = null;
+  // ── ⓪ 先确认客户端退出，再回写会话索引 ──
+  //
+  // 顺序很关键：回写会被"客户端在跑就拒绝动库"的保护挡掉。若客户端还在跑就回写，
+  // 那次调用**静默无效**，接着账号目录连同它私有库里的 tasks-index.sqlite
+  // 一起进回收站 —— 这个号在客户端里新建的会话就永久没了，别处能看到的历史凭空少一截。
+  // 所以先停客户端（这一步在删除流程里本来也要做，只是原来拖到改名失败才做）。
+  const stop = await ensureZCodeStopped('删除 ' + id);
+  let killedClient = !stop.ok;   // 没停干净也不硬拦删除，但要如实告知
 
-  // 【会话记录不回丢】删除前先把该账号这一轮的会话索引并回共享库。
-  // 不这么做的话，账号目录连同它私有库里的 tasks-index.sqlite 一起进回收站，
-  // 这个号在客户端里新建的会话就跟着消失了 —— 别处能看到的历史记录凭空少一截。
-  // 放在改名之前：此时目录还在，回写才读得到源。
-  try {
-    const note = sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir());
-    if (note && note !== 'not-seeded') console.log('[session-index] 删除前回写 ' + id + '：' + note);
-  } catch (e) {
+  if (stop.ok) {
+    let note = 'no-account';
+    try { note = sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
+    catch (e) { note = 'THREW(' + ((e && e.message) || e) + ')'; }
+    if (note && note !== 'not-seeded' && note !== 'no-datadir') {
+      console.log('[session-index] 删除前回写 ' + id + '：' + note);
+    }
     // 回写失败不阻断删除：使用者的意图是移除账号，别因为会话回写卡住他。
-    // 但必须让他知道"这个号里的会话没能并回共享库"，否则事后无从解释。
-    console.warn('[session-index] 删除前回写失败：' + (e.message || e));
+    // 但必须让他知道"这个号里的会话没能并回公共库"，否则事后无从解释。
+    if (/^(THREW|source-corrupt|failed)/.test(String(note))) {
+      console.warn('[session-index] 删除前回写失败：' + note);
+    }
+  } else {
+    console.warn('[session-index] 客户端没能停干净，删除前无法回写会话索引（该号的会话可能不进公共库）');
   }
+
+  let lastErr = null;
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -1388,8 +1528,8 @@ async function deleteAccount(id) {
     } catch (e) {
       lastErr = e;
       if (!isLockError(e)) break;                 // 不是占用问题，别浪费轮次
-      if (!killedClient) {                        // 第一次撞到占用：关掉客户端再试
-        await killZCode();
+      if (!killedClient) {                        // 前面没停干净，再强杀一次并等它归零
+        await ensureZCodeStopped('删除重试 ' + id);
         killedClient = true;
       }
       await wait(600 * (attempt + 1));            // 等 Windows 把句柄真正放掉
@@ -1511,13 +1651,21 @@ async function rollback() {
     };
   }
 
-  await killZCode();
-  await wait(600);
+  // 必须确认客户端真的退干净：下面要在它的数据根上做会话回写。
+  const stop = await ensureZCodeStopped('重启 ' + id);
+  if (!stop.ok) {
+    return { ok: false, msg: 'ZCode 没能完全退出（还有进程在跑），已中止重启 —— 请手动退出客户端后重试' };
+  }
 
   // 同一账号重启也要先回写：这一轮在客户端里新建的会话此时只落在账号私有库，
   // 不回写的话下次启动 syncIn 会用共享库盖掉它们（标记还在，走覆盖分支）。
-  try { sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
-  catch (e) { console.warn('[session-index] 回写失败：' + (e.message || e)); }
+  // 回写失败不阻断重启（同一账号，数据没跨账号搬），但要说出来。
+  let wbNote = 'no-account';
+  try { wbNote = sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
+  catch (e) { wbNote = 'THREW(' + ((e && e.message) || e) + ')'; }
+  if (/^(THREW|source-corrupt|failed)/.test(String(wbNote))) {
+    console.warn('[session-index] 重启前回写失败：' + wbNote);
+  }
 
   let launchError = null;
   try {
@@ -3159,12 +3307,23 @@ ipcMain.handle('app:open', async () => {
   if (!id) {
     return { ok: false, msg: '还没有选中账号。先在列表里切一个，或点「捕获当前登录」把当前账号存进来。' };
   }
-  await killZCode();
-  await wait(500);
+  // 必须确认客户端真的退干净，否则下面的会话回写会被"活库保护"静默跳过。
+  const stop = await ensureZCodeStopped('重启客户端 ' + id);
+  if (!stop.ok) {
+    return { ok: false, msg: 'ZCode 没能完全退出（还有进程在跑），已中止 —— 请手动退出客户端后重试' };
+  }
 
   // 关客户端 → 立刻开机也要先回写，否则中间那段新建的会话只在账号私有库
-  try { sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
-  catch (e) { console.warn('[session-index] 回写失败：' + (e.message || e)); }
+  let wbNote = 'no-account';
+  try { wbNote = sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
+  catch (e) { wbNote = 'THREW(' + ((e && e.message) || e) + ')'; }
+  if (wbNote === 'running') {
+    // 走到这里说明"确认退出"之后它又被谁拉起来了 —— 不能假装成功
+    return { ok: false, msg: 'ZCode 又被启动了，会话索引没能并回公共库，已中止。请关闭客户端后重试。' };
+  }
+  if (/^(THREW|source-corrupt|failed)/.test(String(wbNote))) {
+    console.warn('[session-index] 开机前回写失败：' + wbNote);
+  }
 
   try {
     await launchZCode(id);
@@ -3177,7 +3336,7 @@ ipcMain.handle('app:quit', async () => {
   // 退出面板时把当前账号的会话索引并回共享库。
   // 面板关掉之后没人再有机会做这件事，留着不回写 = 这一轮会话卡在账号私有库里。
   const id = readCurrentId();
-  await killZCode();
+  await ensureZCodeStopped('退出面板');
   if (id) {
     try { sessionIndex.syncOutAccount(id, LEGACY_ZCODE_V2, accountsDir()); }
     catch (e) { console.warn('[session-index] 退出前回写失败：' + (e.message || e)); }
