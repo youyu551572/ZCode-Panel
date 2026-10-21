@@ -196,6 +196,154 @@ function invalidateProviderConfig(accountId) {
   }
 }
 
+// ───────────────────────────────────────── 套餐 provider 选择同步
+//
+// 为什么切号必须做这一步（**「登录上去却显示没有可用的模型」的真病根**）：
+//
+//   ZCode 3.14+ 从 `setting.json` 读两处「选中哪个套餐 provider」：
+//       providerFamilyConnectionSelections.<family>.kind   这个账号是什么套餐
+//       modelProviderFamilySelectedKeys.<family>          选中哪个 provider 条目
+//   这两处必须一致。而 `setting.json` **全机器只有一份**（跨账号共享），
+//   面板切号时若不改写，切到套餐类型不同的账号就会不匹配。
+//
+//   实测（3.14 源码 config/provider/zcode-builtin.json）：
+//       individual-coding-plan → https://open.bigmodel.cn/api/anthropic
+//       start-plan             → https://zcode.z.ai/api/v1/zcode-plan/anthropic
+//   选错就把凭据发到**另一个套餐的端点**，服务端拒绝（实测 405）。
+//
+//   还有一处更隐蔽：`providerFamilyDomain` = 界面「当前在看哪个家族」。
+//   客户端自己登录成功时会把它写成刚连上的那个家族。面板切号过去却不改它，
+//   于是切到 zai 号后界面还在看 bigmodel —— 而新号没有 bigmodel 凭据，
+//   客户端把 `account:bigmodel-individual-coding-plan` 标成 unavailableReason=not-connected，
+//   界面就直接显示「当前没有可用模型」。
+
+/**
+ * 这个家族在本账号里是不是**真的**有个人编程套餐。
+ *
+ * 唯一硬证据：credentials.json 里有没有这把按账号派生的请求密钥
+ *   `account-provider:coding-plan:account:<family>-individual-coding-plan:account:<uid>:api-key`
+ *
+ * 客户端 `AccountProviderRequestAuthService.resolveCurrent` 在
+ * planKind=individual-coding-plan 时**只**认它，取不到就抛
+ *   Account request credential is unavailable: account:<family>-individual-coding-plan
+ * 界面表现同样是「未登录 / 没有可用模型」。
+ *
+ * ⚠️ 别按「config 里哪个 builtin 开着」去推：*PROVIDER_FAMILY* 会把
+ *    `*-coding-plan` 和 `*-start-plan` 两个都启用，于是永远推出 individual-coding-plan。
+ *    参考项目 2026-09-25 的 jordan5657 就是这么坏的：
+ *    Z.ai 邮箱注册的免费号只有 Start Plan、没有这把 key，被写成 individual → 界面未登录。
+ */
+function hasIndividualPlanCred(cred, family) {
+  if (!cred || typeof cred !== 'object') return false;
+  return Object.keys(cred).some((k) => k.startsWith('account-provider:coding-plan:')
+    && k.includes(`account:${family}-individual-coding-plan`)
+    && k.endsWith(':api-key'));
+}
+
+/**
+ * 把某个账号的套餐类型同步进 ZCode 的 setting.json（切号前调用）。
+ *
+ * 推导依据：该账号自己 config.json 里哪个 builtin 套餐 provider 处于启用状态，
+ * 结合 credentials.json 里有没有个人套餐密钥决定 kind。
+ *
+ * @returns {boolean} 是否改动过 setting.json
+ */
+function syncProviderSelection(accountDir) {
+  const cfg = safeJson(path.join(accountDir, 'config.json'));
+  if (!cfg || !cfg.provider) return false;
+
+  /**
+   * 「这个 provider 入口是不是开着」。
+   *
+   * ⚠️ **不能只写 `!!cfg.provider[pid].enabled`**：
+   *    3.15.3 生成的 config.json 里，内置套餐 provider 只写 `options`，
+   *    **根本不含 `enabled` 字段**（实测整份是 {options:{apiKey,baseURL,apiKeyRequired}}）。
+   *    那样 `enabled` 恒为 undefined ⇒ on() 恒 false ⇒ fams 为空 ⇒ 本函数直接 return，
+   *    setting.json 就保持上一个账号的值 —— 切号后界面「当前没有可用模型」。
+   *    参考项目 2026-10-19 phs007 事故：providerFamilyDomain 停在 bigmodel、
+   *    kind 停在 individual-coding-plan，而 config 里只有 *-start-plan。
+   *    所以「字段缺失」要当成启用：条目存在本身就说明客户端配了这个入口。
+   */
+  const on = (pid) => {
+    const v = cfg.provider[pid];
+    if (!v) return false;
+    return v.enabled === undefined ? true : !!v.enabled;
+  };
+  const cred = safeJson(path.join(accountDir, 'credentials.json'));
+
+  const setting = safeJson(zcodeSettingFile());
+  if (!setting || typeof setting !== 'object') return false;
+
+  const fams = {};
+  for (const p of ['bigmodel', 'zai']) {
+    if (!on(`builtin:${p}-coding-plan`) && !on(`builtin:${p}-start-plan`)) continue;
+    // 有个人套餐密钥 → individual-coding-plan；否则一律 start-plan。
+    // （bigmodel 那批号凭据里本来就带密钥，判定结果与旧逻辑一致，不会动到它们。）
+    const kind = hasIndividualPlanCred(cred, p) ? 'individual-coding-plan' : 'start-plan';
+    fams[p] = {
+      kind,
+      key: `coding-plan:builtin:${p}-${kind === 'start-plan' ? 'start-plan' : 'coding-plan'}`,
+    };
+  }
+  if (!Object.keys(fams).length) return false;
+
+  // 账号属于哪个家族：看它自己的 OAuth 凭据（顺带要求该家族在 config 里有套餐入口）
+  const credFams = ['zai', 'bigmodel'].filter((f) => cred && cred[`oauth:${f}:access_token`]);
+  const family = credFams.find((f) => fams[f]) || credFams[0] || null;
+
+  if (!setting.providerFamilyConnectionSelections) setting.providerFamilyConnectionSelections = {};
+  if (!setting.modelProviderFamilySelectedKeys) setting.modelProviderFamilySelectedKeys = {};
+  let changed = false;
+  for (const [fam, v] of Object.entries(fams)) {
+    const curKind = (setting.providerFamilyConnectionSelections[fam] || {}).kind;
+    const curKey = setting.modelProviderFamilySelectedKeys[fam];
+    if (curKind !== v.kind) {
+      setting.providerFamilyConnectionSelections[fam] = { kind: v.kind };
+      changed = true;
+    }
+    if (curKey !== v.key) {
+      setting.modelProviderFamilySelectedKeys[fam] = v.key;
+      changed = true;
+    }
+  }
+
+  // providerFamilyDomain = 界面「当前在看哪个家族」。
+  // 不跟着改，切到 zai 号后界面还在看 bigmodel → 显示「当前没有可用模型」。
+  if (family && setting.providerFamilyDomain !== family) {
+    setting.providerFamilyDomain = family;
+    setting.providerFamilyDomainUpdatedAt = Date.now();
+    changed = true;
+  }
+
+  if (!changed) return false;
+  // 正常情况下 <账号>/home/.zcode 已联回真实 ~/.zcode（同一个文件）；
+  // 联接没建成时客户端读的是账号私有那份，所以两个目标都写。
+  const targets = [zcodeSettingFile()];
+  for (const t of settingWriteTargets(accountDir)) {
+    if (!targets.some((x) => path.resolve(x) === path.resolve(t))) targets.push(t);
+  }
+  for (const t of targets) writeJsonAtomic(t, setting);
+  return true;
+}
+
+/**
+ * setting.json 可能被写的所有位置。
+ *
+ * 3.14 起 `gettingSettingFile() = resolveUserHomeDir()/.zcode/v2/setting.json`，
+ * 而 `resolveUserHomeDir()` 跟随 `ZCODE_DESKTOP_HOME_DIR`。
+ * 面板把 <账号>/home/.zcode 联回了真实 ~/.zcode —— 正常情况下两者是同一个文件；
+ * 但联接没建成（权限、路径被占）时客户端读的是账号私有那份，
+ * 只写共享那份就等于没写。所以两个目标都列出来。
+ */
+function settingWriteTargets(accountDir) {
+  const out = [];
+  try {
+    const dir = accountDir || (readCurrentId() ? path.join(accountsDir(), readCurrentId()) : null);
+    if (dir) out.push(path.join(dir, 'home', '.zcode', 'v2', 'setting.json'));
+  } catch (_) { /* 无账号就不列 */ }
+  return out;
+}
+
 // 当前账号记在 accounts/.current 里（`.` 开头，账号扫描会跳过）。
 // 比"从 live 凭据反查账号"可靠得多：新架构下 live 就是账号自己的目录，
 // 不再需要猜测，认错账号导致串号的问题从根上没有了。
@@ -1408,6 +1556,35 @@ async function switchAccount(id, opts = {}) {
   writeCurrentId(id);
   bumpSwitchMeta(dir, 'switch');
 
+  // ★ 切号必须把「套餐 provider 选择」同步进 setting.json。
+  //
+  //   `setting.json` 全机器只有一份（跨账号共享），里面记着
+  //   「这个家族是什么套餐（kind）」和「选中哪个 provider 条目（key）」，
+  //   外加「界面当前在看哪个家族（providerFamilyDomain）」。
+  //   不按新账号改写这三处，切过去就会：
+  //     · 套餐类型不匹配 → 凭据被发到**另一个套餐的端点** → 服务端拒绝（实测 405）
+  //     · 或界面还盯着上一个家族 → 新号那家族没有对应凭据 →
+  //       客户端标 unavailableReason=not-connected → **界面显示「当前没有可用模型」**
+  //
+  //   必须在 launchZCode 之前做：客户端启动瞬间就会读 setting.json。
+  let providerNote = 'skip';
+  try {
+    providerNote = syncProviderSelection(dir) ? 'synced' : 'no-change';
+  } catch (e) {
+    providerNote = 'fail(' + ((e && e.message) || e) + ')';
+  }
+  if (providerNote === 'synced') console.log('[provider] 已按账号 ' + id + ' 同步套餐 provider 选择到 setting.json');
+
+  // ★ 并让该账号的 provider_config.json 失效，逼客户端从新的 config.json 重新导入。
+  //
+  //   v3.14+ 客户端只在 provider_config.json **不存在**时做一次性 legacy 导入。
+  //   留着上一个账号的那份，或者留着这份但内容已过期，
+  //   客户端就会沿用旧 provider 列表 —— 同样表现为「没有可用的模型」。
+  //   丢掉是安全的：providerId / apiKey / baseUrl / personalModelIds
+  //   都能从 config.json 完整重建（参考项目逐字段比对过）。
+  const providerConfigDropped = invalidateProviderConfig(id);
+  if (providerConfigDropped) console.log('[provider] 已清除 ' + id + ' 的 provider_config.json，逼客户端重导入');
+
   // 客户端启动失败不该把整次切换判为失败：标记已经改好，凭据也各在各家，
   // 只是进程没起来。分开报，免得使用者以为没切过去而反复重试。
   let launchError = null;
@@ -1422,6 +1599,8 @@ async function switchAccount(id, opts = {}) {
     prevId: prevId || null,
     noRollbackTarget: !prevId,
     launchError,
+    providerSelection: providerNote,
+    providerConfigDropped,
   };
 }
 
@@ -1666,6 +1845,11 @@ async function rollback() {
   if (/^(THREW|source-corrupt|failed)/.test(String(wbNote))) {
     console.warn('[session-index] 重启前回写失败：' + wbNote);
   }
+
+  // 重启也要重同步套餐选择：setting.json 是共享的，期间可能被别的账号改过，
+  // 不同步就会落到「登录着但没有可用模型」。
+  try { syncProviderSelection(path.join(accountsDir(), id)); } catch (_) {}
+  invalidateProviderConfig(id);
 
   let launchError = null;
   try {
@@ -3324,6 +3508,11 @@ ipcMain.handle('app:open', async () => {
   if (/^(THREW|source-corrupt|failed)/.test(String(wbNote))) {
     console.warn('[session-index] 开机前回写失败：' + wbNote);
   }
+
+  // 开机前重同步套餐 provider 选择：setting.json 是共享的，可能已被别的账号改过。
+  // 不同步 → 客户端起来后「登录着但没有可用模型」。
+  try { syncProviderSelection(path.join(accountsDir(), id)); } catch (_) {}
+  invalidateProviderConfig(id);
 
   try {
     await launchZCode(id);
